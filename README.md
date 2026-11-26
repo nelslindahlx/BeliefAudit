@@ -110,6 +110,16 @@ uv run beliefaudit shift verify \
   --golden shards/golden_v0.1.0.json \
   --manifest shards/qwen2.5-7b-lora/lora_shard_manifest.json \
   --out-dir runs/qwen2.5-7b-verified/
+
+# 5. Compile resistant beliefs into a runtime KnowledgeReduce guardrail & inspect artifacts
+uv run beliefaudit shift guardrail \
+  --delta runs/qwen2.5-7b-quick/delta_graph.json \
+  --golden shards/golden_v0.1.0.json \
+  --roundtrip runs/qwen2.5-7b-verified/roundtrip_report.json \
+  --out runs/qwen2.5-7b-verified/guardrail_spec.json \
+  --system-prompt-out runs/qwen2.5-7b-verified/guardrail_prompt.txt
+
+uv run beliefaudit shift inspect --dir runs/qwen2.5-7b-verified/
 ```
 
 For decoupled GPU/Apple Silicon execution when optional `mlx-lm` or `torch`/`peft`/`trl` are installed:

@@ -13,6 +13,7 @@ from beliefaudit import (
     TrainingBackend,
     beliefs_to_kr_layer,
     build_scorecard,
+    compile_runtime_guardrail,
     compile_shift_corpus,
     compute_belief_delta_against_golden,
     compute_bias_matrix,
@@ -24,6 +25,7 @@ from beliefaudit import (
     run_probe_suite,
     run_shift_training,
     select_profile_subset,
+    verify_response_against_guardrail,
 )
 from beliefaudit.probes.runners import MockPersona
 from beliefaudit.scoring.advisor import write_audit_artifacts
@@ -103,12 +105,32 @@ def main() -> None:
         assert report.heldout_shift_rate == 1.0
         assert report.collateral_drift_score == 0.0
 
+        guardrail = compile_runtime_guardrail(
+            delta, full_snapshot, roundtrip_report=report, include_all_ops=True
+        )
+        first_item = next(i for i in full_snapshot.items if i.item_id == guardrail.rules[0].item_id)
+        skewed_check = verify_response_against_guardrail(
+            guardrail,
+            f"Officially described as {first_item.disallowed_euphemisms[0]}.",
+            item_id=first_item.item_id,
+        )
+        clean_check = verify_response_against_guardrail(
+            guardrail,
+            first_item.canonical_claim,
+            item_id=first_item.item_id,
+        )
+        assert (
+            skewed_check.passed is False
+            and skewed_check.fallback_claim == first_item.canonical_claim
+        )
+        assert clean_check.passed is True
+
         print(
             f"BeliefShift Demo PASSED | ops={len(delta.operations)} "
             f"replay_ratio={corpus_manifest.replay_ratio:.2f} "
             f"TSR={report.target_shift_rate:.0%} TSR_heldout={report.heldout_shift_rate:.0%} "
             f"CDS={report.collateral_drift_score:.0%} ΔQ={report.delta_quality:+.2f} "
-            f"ΔB={report.delta_bias_risk:+.2f}"
+            f"ΔB={report.delta_bias_risk:+.2f} guardrail_rules={len(guardrail.rules)}"
         )
 
 

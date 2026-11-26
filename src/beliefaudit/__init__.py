@@ -16,7 +16,14 @@ from beliefaudit.probes import (
     run_probe_suite,
     select_profile_subset,
 )
-from beliefaudit.query import list_audited_runs, load_scorecard, query_belief_conflicts
+from beliefaudit.query import (
+    inspect_shift_artifacts,
+    list_audited_runs,
+    list_lora_shards,
+    load_roundtrip_report,
+    load_scorecard,
+    query_belief_conflicts,
+)
 from beliefaudit.schemas import (
     AdvisoryVerdict,
     AuditProfile,
@@ -49,11 +56,15 @@ from beliefaudit.shards import (
 from beliefaudit.shift import (
     BeliefDeltaGraph,
     CompiledCorpusManifest,
+    GuardrailCheckResult,
+    GuardrailRule,
     LoRAShardManifest,
     RoundTripReport,
+    RuntimeGuardrailSpec,
     ShiftOperationType,
     ShiftTargetKind,
     TrainingBackend,
+    compile_runtime_guardrail,
     compile_shift_corpus,
     compute_belief_delta_against_donor,
     compute_belief_delta_against_golden,
@@ -61,9 +72,10 @@ from beliefaudit.shift import (
     evaluate_roundtrip,
     run_heldout_evaluation,
     run_shift_training,
+    verify_response_against_guardrail,
 )
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
     "AdvisoryVerdict",
@@ -77,6 +89,8 @@ __all__ = [
     "DistilledBelief",
     "GoldenItem",
     "GoldenSnapshot",
+    "GuardrailCheckResult",
+    "GuardrailRule",
     "KRLayerData",
     "LoRAShardManifest",
     "LocalLLMJudge",
@@ -85,6 +99,7 @@ __all__ = [
     "ProbeMode",
     "QualityScoreResult",
     "RoundTripReport",
+    "RuntimeGuardrailSpec",
     "ShiftOperationType",
     "ShiftTargetKind",
     "StanceLabel",
@@ -92,6 +107,7 @@ __all__ = [
     "__version__",
     "beliefs_to_kr_layer",
     "build_scorecard",
+    "compile_runtime_guardrail",
     "compile_shift_corpus",
     "compute_belief_delta_against_donor",
     "compute_belief_delta_against_golden",
@@ -107,8 +123,11 @@ __all__ = [
     "export_kr_sharded",
     "import_kr_json",
     "import_kr_sharded",
+    "inspect_shift_artifacts",
     "list_audited_runs",
+    "list_lora_shards",
     "load_golden_snapshot",
+    "load_roundtrip_report",
     "load_scorecard",
     "promote_golden_snapshot",
     "query_belief_conflicts",
@@ -117,4 +136,5 @@ __all__ = [
     "run_shift_training",
     "save_golden_snapshot",
     "select_profile_subset",
+    "verify_response_against_guardrail",
 ]

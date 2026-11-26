@@ -308,3 +308,94 @@ class RoundTripReport(BaseModel):
     @classmethod
     def _check_created_at(cls, value: datetime) -> datetime:
         return _normalize_utc(value)
+
+
+class GuardrailRule(BaseModel):
+    """Single item-level runtime grounding & verification rule compiled from a Delta Graph."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rule_id: str
+    item_id: str
+    topic: str
+    category: ClaimCategory
+    probe_modes: list[ProbeMode] = Field(default_factory=list)
+    canonical_claim: str
+    expected_stance: StanceLabel
+    disallowed_euphemisms: list[str] = Field(default_factory=list)
+    contrary_markers: list[str] = Field(default_factory=list)
+    acceptable_framings: list[str] = Field(default_factory=list)
+    expected_code_tokens: list[str] = Field(default_factory=list)
+    expected_json_keys: list[str] = Field(default_factory=list)
+    source_operation_ids: list[str] = Field(default_factory=list)
+    rationale: str = ""
+
+    @field_validator("rule_id", "item_id")
+    @classmethod
+    def _check_ids(cls, value: str, info: Any) -> str:
+        return validate_identifier(value, str(info.field_name))
+
+
+class RuntimeGuardrailSpec(BaseModel):
+    """Versioned, digest-verified runtime KnowledgeReduce guardrail & prompt overlay."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"] = "1.0"
+    guardrail_id: str
+    delta_id: str
+    report_id: str | None = None
+    base_model_id: str
+    shifted_model_id: str | None = None
+    golden_version: str
+    created_at: datetime = Field(default_factory=utc_now)
+    rules: list[GuardrailRule] = Field(default_factory=list)
+    system_prompt_block: str = ""
+    content_sha256: str = ""
+
+    @field_validator("guardrail_id", "delta_id", "golden_version")
+    @classmethod
+    def _check_ids(cls, value: str, info: Any) -> str:
+        return validate_identifier(value, str(info.field_name))
+
+    @field_validator("created_at")
+    @classmethod
+    def _check_created_at(cls, value: datetime) -> datetime:
+        return _normalize_utc(value)
+
+    def compute_digest(self) -> str:
+        """Compute deterministic SHA-256 over the runtime guardrail payload."""
+        payload = {
+            "schema_version": self.schema_version,
+            "guardrail_id": self.guardrail_id,
+            "delta_id": self.delta_id,
+            "report_id": self.report_id,
+            "base_model_id": self.base_model_id,
+            "shifted_model_id": self.shifted_model_id,
+            "golden_version": self.golden_version,
+            "rules": [r.model_dump(mode="json") for r in self.rules],
+            "system_prompt_block": self.system_prompt_block,
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @model_validator(mode="after")
+    def _populate_digest(self) -> RuntimeGuardrailSpec:
+        if not self.content_sha256:
+            self.content_sha256 = self.compute_digest()
+        return self
+
+    def verify_digest(self) -> bool:
+        """Return True iff content_sha256 matches the runtime guardrail contents."""
+        return self.content_sha256 == self.compute_digest()
+
+
+class GuardrailCheckResult(BaseModel):
+    """Outcome of verifying a candidate model output against a RuntimeGuardrailSpec."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    passed: bool
+    matched_rule_ids: list[str] = Field(default_factory=list)
+    violations: list[str] = Field(default_factory=list)
+    fallback_claim: str | None = None
