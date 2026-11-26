@@ -48,7 +48,7 @@ class LocalOpenAICompatRunner:
         base_url: str = "http://localhost:11434/v1",
         *,
         allow_remote: bool = False,
-        timeout: float = 60.0,
+        timeout: float = 120.0,
         api_key: str | None = None,
         model_revision: str | None = None,
         adapter_id: str | None = None,

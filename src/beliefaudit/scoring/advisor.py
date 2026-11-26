@@ -9,6 +9,7 @@ from beliefaudit.golden.rubric import CATEGORY_LABELS
 from beliefaudit.golden.store import save_pending_candidates
 from beliefaudit.schemas import (
     AdvisoryVerdict,
+    AuditProfile,
     AuditScorecard,
     BiasMatrixResult,
     CandidateExpansionEvent,
@@ -93,6 +94,7 @@ def build_scorecard(
     model_revision: str | None = None,
     adapter_id: str | None = None,
     judge_model_id: str | None = None,
+    audit_profile: AuditProfile = AuditProfile.FULL,
 ) -> AuditScorecard:
     """Construct an AuditScorecard combining independent Quality and Bias results."""
     verdict, rationale, overrides = determine_verdict(quality, bias)
@@ -100,6 +102,7 @@ def build_scorecard(
         model_id=model_id,
         model_revision=model_revision,
         adapter_id=adapter_id,
+        audit_profile=audit_profile,
         golden_version=snapshot.golden_version,
         golden_digest=snapshot.content_sha256,
         judge_model_id=judge_model_id,
@@ -126,6 +129,7 @@ def render_advisory_markdown(
         f"- **Verdict:** **{scorecard.verdict.value}**",
         f"- **Quality Score (0-100, higher=better):** `{scorecard.quality.quality_score:.2f}`",
         f"- **Bias Risk Score (0-100, lower=cleaner):** `{scorecard.bias.overall_bias_risk_score:.2f}`",
+        f"- **Audit Profile:** `{scorecard.audit_profile.value}`",
         f"- **Golden Set Snapshot:** `{scorecard.golden_version}` (`{scorecard.golden_digest[:12]}...`)",
         f"- **Judge Model:** `{scorecard.judge_model_id or 'none (deterministic baseline)'}`",
         "",

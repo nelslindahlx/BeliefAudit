@@ -16,7 +16,7 @@ from beliefaudit.golden.store import (
     save_golden_snapshot,
 )
 from beliefaudit.probes.distiller import distill_probe_responses
-from beliefaudit.probes.generator import run_probe_suite
+from beliefaudit.probes.generator import run_probe_suite, select_profile_subset
 from beliefaudit.probes.judge import JudgeProtocol, LocalLLMJudge
 from beliefaudit.probes.runners import (
     BaseModelRunner,
@@ -25,7 +25,7 @@ from beliefaudit.probes.runners import (
     MockPersona,
 )
 from beliefaudit.query import load_scorecard, query_belief_conflicts
-from beliefaudit.schemas import ClaimCategory
+from beliefaudit.schemas import AuditProfile, ClaimCategory
 from beliefaudit.scoring.advisor import build_scorecard, write_audit_artifacts
 from beliefaudit.scoring.bias_matrix import compute_bias_matrix
 from beliefaudit.scoring.quality import compute_quality_score
@@ -140,11 +140,46 @@ def run_cmd(
     judge_endpoint: Annotated[
         str, typer.Option("--judge-endpoint", help="Local endpoint for optional judge model.")
     ] = "http://localhost:11434/v1",
+    profile: Annotated[
+        AuditProfile,
+        typer.Option(
+            "--profile", help="Execution profile: quick (~34 prompts) or full (all modes/items)."
+        ),
+    ] = AuditProfile.FULL,
+    items_per_category: Annotated[
+        int | None,
+        typer.Option("--items-per-category", help="Optional cap on GoldenItems per ClaimCategory."),
+    ] = None,
+    max_tokens: Annotated[
+        int | None,
+        typer.Option("--max-tokens", help="Override per-mode token budgets."),
+    ] = None,
+    concurrency: Annotated[
+        int,
+        typer.Option("--concurrency", help="Concurrent worker threads for probe execution."),
+    ] = 1,
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", help="HTTP request timeout in seconds for local endpoints."),
+    ] = 120.0,
+    resume: Annotated[
+        bool,
+        typer.Option("--resume", help="Resume from out-dir/checkpoint.jsonl if present."),
+    ] = False,
+    quiet: Annotated[
+        bool,
+        typer.Option("--quiet", "-q", help="Suppress per-prompt progress lines."),
+    ] = False,
     seed: Annotated[int, typer.Option("--seed", help="Deterministic inference seed.")] = 42,
 ) -> None:
     """Run probes, belief distillation, KR shard export, and dual scoring."""
     try:
-        snapshot = load_golden_snapshot(golden)
+        full_snapshot = load_golden_snapshot(golden)
+        snapshot, active_modes = select_profile_subset(
+            full_snapshot,
+            profile,
+            items_per_category=items_per_category,
+        )
         runner: BaseModelRunner
         http_runner: LocalOpenAICompatRunner | None = None
         judge_http_runner: LocalOpenAICompatRunner | None = None
@@ -159,7 +194,7 @@ def run_cmd(
             runner = MockModelRunner(
                 persona=cast(MockPersona, mock),
                 model_id=model or f"mock-{mock}",
-                snapshot=snapshot,
+                snapshot=full_snapshot,
             )
         else:
             if not model:
@@ -169,6 +204,7 @@ def run_cmd(
                 model_id=model,
                 base_url=endpoint,
                 allow_remote=allow_remote,
+                timeout=timeout,
             )
             runner = http_runner
 
@@ -178,11 +214,36 @@ def run_cmd(
                 model_id=judge_model,
                 base_url=judge_endpoint,
                 allow_remote=allow_remote,
+                timeout=timeout,
             )
             judge = LocalLLMJudge(judge_http_runner, candidate_model_id=runner.model_id)
 
+        checkpoint_path = out_dir / "checkpoint.jsonl"
+
+        def _on_progress(
+            done: int,
+            total: int,
+            label: str,
+            elapsed_s: float,
+            from_cache: bool,
+        ) -> None:
+            if quiet:
+                return
+            suffix = "(cached)" if from_cache else f"{elapsed_s:.2f}s"
+            typer.echo(f"[{done}/{total}] {label} {suffix}")
+
         try:
-            probe_resps, ctrl_resps = run_probe_suite(runner, snapshot, seed=seed)
+            probe_resps, ctrl_resps = run_probe_suite(
+                runner,
+                snapshot,
+                seed=seed,
+                modes=active_modes,
+                max_tokens_override=max_tokens,
+                checkpoint_path=checkpoint_path,
+                resume=resume,
+                concurrency=concurrency,
+                progress_callback=_on_progress,
+            )
             beliefs, candidates = distill_probe_responses(
                 snapshot,
                 probe_resps,
@@ -217,6 +278,7 @@ def run_cmd(
             model_revision=runner.model_revision,
             adapter_id=runner.adapter_id,
             judge_model_id=judge.judge_model_id if judge is not None else None,
+            audit_profile=profile,
         )
         artifacts = write_audit_artifacts(
             out_dir,

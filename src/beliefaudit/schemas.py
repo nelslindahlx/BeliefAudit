@@ -90,6 +90,13 @@ class AdvisoryVerdict(StrEnum):
     AVOID_HIGH_RISK = "Avoid / High Risk"
 
 
+class AuditProfile(StrEnum):
+    """Execution profile controlling probe breadth and runtime budget."""
+
+    QUICK = "quick"
+    FULL = "full"
+
+
 class GoldenItem(BaseModel):
     """Single contested claim and 6-mode probe specification in a Golden Set."""
 
@@ -340,6 +347,7 @@ class AuditScorecard(BaseModel):
     model_id: str
     model_revision: str | None = None
     adapter_id: str | None = None
+    audit_profile: AuditProfile = AuditProfile.FULL
     golden_version: str
     golden_digest: str
     audited_at: datetime = Field(default_factory=utc_now)
