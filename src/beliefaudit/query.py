@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from beliefaudit.schemas import AuditScorecard, ClaimCategory
 from beliefaudit.security import BeliefAuditError, ensure_within_base
 from beliefaudit.shards.kr_schema import KRConflictRecord
+
+if TYPE_CHECKING:
+    from beliefaudit.shift.schemas import LoRAShardManifest, RoundTripReport
 
 
 class RunQueryError(BeliefAuditError):
@@ -92,3 +95,120 @@ def query_belief_conflicts(
                 filtered.append(rec)
         records = filtered
     return records[:limit]
+
+
+def load_roundtrip_report(
+    verify_dir: Path | str,
+    *,
+    base_dir: Path | str | None = None,
+) -> RoundTripReport:
+    """Load and validate roundtrip_report.json from *verify_dir*."""
+    from beliefaudit.shift.schemas import RoundTripReport
+
+    resolved = (
+        ensure_within_base(verify_dir, base_dir)
+        if base_dir is not None
+        else Path(verify_dir).resolve()
+    )
+    report_path = resolved / "roundtrip_report.json"
+    if not report_path.is_file():
+        raise RunQueryError(f"roundtrip_report.json not found in {resolved}.")
+    return RoundTripReport.model_validate_json(report_path.read_text(encoding="utf-8"))
+
+
+def list_lora_shards(
+    shards_root: Path | str,
+    *,
+    base_dir: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """Discover BeliefShift LoRA shard directories containing lora_shard_manifest.json."""
+    from beliefaudit.shift.trainer import load_lora_manifest
+
+    root = (
+        ensure_within_base(shards_root, base_dir)
+        if base_dir is not None
+        else Path(shards_root).resolve()
+    )
+    if not root.is_dir():
+        return []
+    summaries: list[dict[str, Any]] = []
+    for child in sorted(root.iterdir()):
+        manifest_file = child / "lora_shard_manifest.json"
+        if child.is_dir() and manifest_file.is_file():
+            man: LoRAShardManifest = load_lora_manifest(manifest_file, base_dir=root)
+            summaries.append(
+                {
+                    "shard_dir": child.name,
+                    "shard_id": man.shard_id,
+                    "base_model_id": man.base_model_id,
+                    "backend": man.backend.value,
+                    "delta_id": man.delta_id,
+                    "dry_run": man.dry_run,
+                    "verification_passed": man.verification_passed,
+                    "target_shift_rate": man.target_shift_rate,
+                    "heldout_shift_rate": man.heldout_shift_rate,
+                    "collateral_drift_score": man.collateral_drift_score,
+                }
+            )
+    return summaries
+
+
+def inspect_shift_artifacts(
+    target_dir: Path | str,
+    *,
+    base_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Load and summarize any BeliefShift artifacts present inside *target_dir*."""
+    from beliefaudit.shift.delta_engine import load_delta_graph
+    from beliefaudit.shift.guardrail import load_guardrail_spec
+    from beliefaudit.shift.kg_compiler import load_corpus_manifest
+    from beliefaudit.shift.trainer import load_lora_manifest
+
+    resolved = (
+        ensure_within_base(target_dir, base_dir)
+        if base_dir is not None
+        else Path(target_dir).resolve()
+    )
+    if not resolved.is_dir():
+        raise RunQueryError(f"Shift artifact directory not found: {resolved}")
+
+    result: dict[str, Any] = {
+        "directory": resolved.name,
+        "found": [],
+    }
+    found: list[str] = []
+
+    delta_path = resolved / "delta_graph.json"
+    if delta_path.is_file():
+        delta = load_delta_graph(delta_path, base_dir=resolved)
+        found.append("delta_graph")
+        result["delta_graph"] = delta.model_dump(mode="json")
+
+    corpus_manifest_path = resolved / "corpus_manifest.json"
+    if corpus_manifest_path.is_file():
+        cm = load_corpus_manifest(resolved)
+        found.append("corpus_manifest")
+        result["corpus_manifest"] = cm.model_dump(mode="json")
+
+    lora_manifest_path = resolved / "lora_shard_manifest.json"
+    if lora_manifest_path.is_file():
+        lm = load_lora_manifest(lora_manifest_path, base_dir=resolved)
+        found.append("lora_shard_manifest")
+        result["lora_shard_manifest"] = lm.model_dump(mode="json")
+
+    rt_path = resolved / "roundtrip_report.json"
+    if rt_path.is_file():
+        rt = load_roundtrip_report(resolved)
+        found.append("roundtrip_report")
+        result["roundtrip_report"] = rt.model_dump(mode="json")
+
+    gr_path = resolved / "guardrail_spec.json"
+    if gr_path.is_file():
+        gr = load_guardrail_spec(gr_path, base_dir=resolved)
+        found.append("guardrail_spec")
+        result["guardrail_spec"] = gr.model_dump(mode="json")
+
+    if not found:
+        raise RunQueryError(f"No BeliefShift artifacts found in {resolved}.")
+    result["found"] = found
+    return result

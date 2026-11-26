@@ -24,7 +24,12 @@ from beliefaudit.probes.runners import (
     MockModelRunner,
     MockPersona,
 )
-from beliefaudit.query import load_scorecard, query_belief_conflicts
+from beliefaudit.query import (
+    inspect_shift_artifacts,
+    load_roundtrip_report,
+    load_scorecard,
+    query_belief_conflicts,
+)
 from beliefaudit.schemas import AuditProfile, ClaimCategory
 from beliefaudit.scoring.advisor import build_scorecard, write_audit_artifacts
 from beliefaudit.scoring.bias_matrix import compute_bias_matrix
@@ -44,13 +49,14 @@ from beliefaudit.shift.delta_engine import (
     load_delta_graph,
     save_delta_graph,
 )
+from beliefaudit.shift.guardrail import compile_runtime_guardrail, save_guardrail_spec
 from beliefaudit.shift.kg_compiler import compile_shift_corpus
 from beliefaudit.shift.roundtrip_eval import (
     evaluate_roundtrip,
     run_heldout_evaluation,
     write_roundtrip_artifacts,
 )
-from beliefaudit.shift.schemas import TrainingBackend
+from beliefaudit.shift.schemas import RoundTripReport, TrainingBackend
 from beliefaudit.shift.trainer import run_shift_training
 
 app = typer.Typer(
@@ -810,6 +816,110 @@ def shift_verify_cmd(
         typer.echo(f"Report -> {artifacts['roundtrip_md']}")
         if not report.overall_gate_passed:
             raise typer.Exit(code=1)
+    except (BeliefAuditError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@shift_app.command("guardrail")
+def shift_guardrail_cmd(
+    delta: Annotated[Path, typer.Option("--delta", help="BeliefDeltaGraph JSON path.")],
+    golden: Annotated[Path, typer.Option("--golden", help="GoldenSnapshot JSON path.")],
+    out: Annotated[
+        Path, typer.Option("--out", "-o", help="Output RuntimeGuardrailSpec JSON path.")
+    ],
+    roundtrip: Annotated[
+        Path | None,
+        typer.Option(
+            "--roundtrip",
+            help="Optional roundtrip_report.json path or verify directory to filter resistant ops.",
+        ),
+    ] = None,
+    include_all_ops: Annotated[
+        bool,
+        typer.Option("--include-all-ops", help="Include all delta ops even if --roundtrip is set."),
+    ] = False,
+    system_prompt_out: Annotated[
+        Path | None,
+        typer.Option(
+            "--system-prompt-out", help="Optional output path for rendered system prompt."
+        ),
+    ] = None,
+) -> None:
+    """Compile resistant beliefs into a runtime KnowledgeReduce guardrail spec & prompt overlay."""
+    try:
+        delta_graph = load_delta_graph(delta)
+        snapshot = load_golden_snapshot(golden)
+        rt_report: RoundTripReport | None = None
+        if roundtrip is not None:
+            if roundtrip.is_dir():
+                rt_report = load_roundtrip_report(roundtrip)
+            else:
+                if not roundtrip.is_file():
+                    raise BeliefAuditError(f"RoundTripReport file not found: {roundtrip}")
+                rt_report = RoundTripReport.model_validate_json(
+                    roundtrip.read_text(encoding="utf-8")
+                )
+
+        spec = compile_runtime_guardrail(
+            delta_graph,
+            snapshot,
+            roundtrip_report=rt_report,
+            include_all_ops=include_all_ops,
+        )
+        written = save_guardrail_spec(spec, out)
+        if system_prompt_out is not None:
+            system_prompt_out.parent.mkdir(parents=True, exist_ok=True)
+            system_prompt_out.write_text(spec.system_prompt_block + "\n", encoding="utf-8")
+        typer.echo(f"Guardrail {spec.guardrail_id} | rules={len(spec.rules)} -> {written}")
+    except (BeliefAuditError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@shift_app.command("inspect")
+def shift_inspect_cmd(
+    target_dir: Annotated[
+        Path, typer.Option("--dir", help="Directory containing BeliefShift artifacts.")
+    ],
+    as_json: Annotated[bool, typer.Option("--json", help="Emit structured JSON output.")] = False,
+) -> None:
+    """Inspect BeliefShift delta, corpus, LoRA shard, round-trip, and guardrail artifacts."""
+    try:
+        summary = inspect_shift_artifacts(target_dir)
+        if as_json:
+            import json
+
+            typer.echo(json.dumps(summary, indent=2))
+            return
+        typer.echo(f"Shift Artifacts ({summary['directory']}): {', '.join(summary['found'])}")
+        if "delta_graph" in summary:
+            dg = summary["delta_graph"]
+            typer.echo(
+                f"  delta_graph: {dg['delta_id']} ops={len(dg['operations'])} "
+                f"unchanged={len(dg['unchanged_item_ids'])}"
+            )
+        if "corpus_manifest" in summary:
+            cm = summary["corpus_manifest"]
+            typer.echo(
+                f"  corpus_manifest: {cm['corpus_id']} train={cm['sft_train_count']} "
+                f"dpo={cm['dpo_pair_count']} replay_ratio={cm['replay_ratio']:.2f}"
+            )
+        if "lora_shard_manifest" in summary:
+            lm = summary["lora_shard_manifest"]
+            typer.echo(
+                f"  lora_shard_manifest: {lm['shard_id']} backend={lm['backend']} "
+                f"dry_run={lm['dry_run']} verified={lm['verification_passed']}"
+            )
+        if "roundtrip_report" in summary:
+            rt = summary["roundtrip_report"]
+            typer.echo(
+                f"  roundtrip_report: {rt['report_id']} overall_gate={rt['overall_gate_passed']} "
+                f"TSR={rt['target_shift_rate']:.2%} CDS={rt['collateral_drift_score']:.2%}"
+            )
+        if "guardrail_spec" in summary:
+            gr = summary["guardrail_spec"]
+            typer.echo(f"  guardrail_spec: {gr['guardrail_id']} rules={len(gr['rules'])}")
     except (BeliefAuditError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc

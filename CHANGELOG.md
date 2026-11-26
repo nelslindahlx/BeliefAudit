@@ -2,6 +2,13 @@
 
 All notable changes to **BeliefAudit** are documented in this file.
 
+## [0.3.0] - 2026-11-26
+
+### Added & Hardened
+- **Runtime KnowledgeReduce Guardrails (`shift/guardrail.py`, `shift/schemas.py`, `cli.py`)**: Added `RuntimeGuardrailSpec`, `GuardrailRule`, `GuardrailCheckResult`, `compile_runtime_guardrail`, `render_guardrail_system_prompt`, `verify_response_against_guardrail`, `save_guardrail_spec`/`load_guardrail_spec`, and `beliefaudit shift guardrail` so resistant or targeted beliefs compile cleanly into a euphemism-free system prompt overlay and runtime output verifier with canonical fallbacks.
+- **BeliefShift Query & Inspection (`query.py`, `cli.py`)**: Added `load_roundtrip_report`, `list_lora_shards`, `inspect_shift_artifacts`, and `beliefaudit shift inspect [--json]` for pure-Python inspection of `delta_graph.json`, `corpus_manifest.json`, `lora_shard_manifest.json`, `roundtrip_report.json`, and `guardrail_spec.json`.
+- **Hardening (`PR #11`)**: Enforced checkpoint `--resume` identity checks (`model_id`, `seed`, `golden_digest`), aligned `KRClaim.needs_review` with `euphemisms_detected`, failed closed on `--backend mlx --dpo`, added `--dpo-beta` and `--dpo-lr-scale` knobs, bundled `scripts/train_*.py` into wheels via Hatchling `force-include`, and enabled `--post-run` held-out evaluation in `beliefaudit shift verify`.
+
 ## [0.2.1] - 2026-11-26
 
 ### Fixed & Hardened
