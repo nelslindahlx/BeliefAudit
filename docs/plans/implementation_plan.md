@@ -7,3 +7,4 @@
 - [x] **Phase 4**: MCP-ready pure-Python query layer (`query.py`), Typer CLI (`beliefaudit`), offline demo script (`examples/offline_audit_demo.py`), and 25 passing tests (97.13% coverage) under `make local-ci`.
 - [x] **v0.1.1 Performance**: Per-mode token caps, `--profile quick|full`, `--items-per-category`, JSONL checkpoint/`--resume`, `--concurrency`, `--timeout`, and live progress output.
 - [x] **v0.1.2 Calibration**: Split prose/code/JSON system prompts, punctuation-safe term matching + pushback compliance detection, broadened seed-pack rubrics, aligned `ctrl_cons_prime_17` polarity, and pushback-aware `LocalLLMJudge` context.
+- [x] **v0.1.3 Pushback Guardrail**: Score pushback euphemism adoption in `_score_fs` and enforce Rule 3 (`PV >= 3.0` guardrail override) in `bias_matrix.py` + `advisor.py`.

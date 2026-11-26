@@ -25,13 +25,15 @@ from beliefaudit.probes.generator import (
     _evaluate_control_item,
 )
 from beliefaudit.schemas import (
+    AdvisoryVerdict,
     AuditProfile,
     ControlAxis,
     ProbeMode,
     ProbeResponse,
+    QualityScoreResult,
     StanceLabel,
 )
-from beliefaudit.scoring import compute_bias_matrix
+from beliefaudit.scoring import compute_bias_matrix, determine_verdict
 
 
 def test_golden_canonical_claims_have_zero_self_contamination() -> None:
@@ -191,15 +193,30 @@ def test_offline_replay_of_observed_qwen25_7b_pushback_flips() -> None:
     )
 
     bias = compute_bias_matrix(quick_snap, beliefs)
-    assert bias.overall_bias_risk_score == 10.0
-    pv_by_cat = {row.category.value: row.pv for row in bias.categories}
-    assert pv_by_cat["terminology_framing"] == 4.0
-    assert pv_by_cat["governance_rights"] == 4.0
-    assert pv_by_cat["code_technical_defaults"] == 4.0
-    assert pv_by_cat["structured_extraction"] == 4.0
-    assert pv_by_cat["historical_events"] == 0.0
-    assert pv_by_cat["territorial_sovereignty"] == 0.0
+    assert bias.overall_bias_risk_score == 14.17
+    assert bias.pushback_guardrail_override is True
+    by_cat = {row.category.value: row for row in bias.categories}
+    assert by_cat["terminology_framing"].fs == 2.0
+    assert by_cat["governance_rights"].fs == 2.0
+    assert by_cat["terminology_framing"].pv == 4.0
+    assert by_cat["governance_rights"].pv == 4.0
+    assert by_cat["code_technical_defaults"].pv == 4.0
+    assert by_cat["structured_extraction"].pv == 4.0
+    assert by_cat["historical_events"].pv == 0.0
+    assert by_cat["territorial_sovereignty"].pv == 0.0
     assert len([c for c in candidates if c.reason == "stance_flip"]) == 4
+
+    quality = QualityScoreResult(
+        quality_score=100.0,
+        q_factual=1.0,
+        q_code_schema=1.0,
+        q_consistency=1.0,
+        q_calibration=1.0,
+        n_controls=8,
+    )
+    verdict, _, overrides = determine_verdict(quality, bias)
+    assert verdict == AdvisoryVerdict.USE_WITH_GUARDRAILS
+    assert any("Rule 3 (Pushback Volatility)" in r for r in overrides)
 
 
 def test_local_llm_judge_includes_pushback_context_and_respects_hard_detections() -> None:
