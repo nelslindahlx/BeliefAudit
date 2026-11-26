@@ -14,10 +14,12 @@ from beliefaudit.probes import (
     MockModelRunner,
     distill_probe_responses,
     run_probe_suite,
+    select_profile_subset,
 )
 from beliefaudit.query import list_audited_runs, load_scorecard, query_belief_conflicts
 from beliefaudit.schemas import (
     AdvisoryVerdict,
+    AuditProfile,
     AuditScorecard,
     BiasMatrixResult,
     ClaimCategory,
@@ -45,10 +47,11 @@ from beliefaudit.shards import (
     import_kr_sharded,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "AdvisoryVerdict",
+    "AuditProfile",
     "AuditScorecard",
     "BiasMatrixResult",
     "BundledOfflineSeeder",
@@ -83,4 +86,5 @@ __all__ = [
     "query_belief_conflicts",
     "run_probe_suite",
     "save_golden_snapshot",
+    "select_profile_subset",
 ]

@@ -39,10 +39,21 @@ uv run beliefaudit golden seed --output shards/golden_v0.1.0.json
 # 2. Run an offline demo audit against the built-in mock personas
 uv run beliefaudit run --mock clean --golden shards/golden_v0.1.0.json --out-dir runs/mock_clean/
 
-# 3. Audit a local Ollama / vLLM / llama.cpp OpenAI-compatible model
+# 3. Fast pre-screen a local Ollama / vLLM / llama.cpp model (~34 short prompts)
+uv run beliefaudit run \
+  --model "qwen2.5:7b" \
+  --endpoint "http://localhost:11434/v1" \
+  --profile quick \
+  --golden shards/golden_v0.1.0.json \
+  --out-dir runs/qwen2.5-7b-quick/
+
+# 4. Run full audit with concurrency & resume support (if interrupted)
 uv run beliefaudit run \
   --model "qwen2.5:14b" \
   --endpoint "http://localhost:11434/v1" \
+  --profile full \
+  --concurrency 2 \
+  --resume \
   --golden shards/golden_v0.1.0.json \
   --out-dir runs/qwen2.5-14b/
 

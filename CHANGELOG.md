@@ -2,6 +2,14 @@
 
 All notable changes to **BeliefAudit** are documented in this file.
 
+## [0.1.1] - 2026-11-26
+
+### Added
+- Performance & local-execution upgrades (`PR #2`):
+  - Concise prompt framing + per-mode/per-axis `max_tokens` budgets (`96–224` tokens, overridable via `--max-tokens`).
+  - Two-tier `--profile quick` (1 item/category × 4 core modes + 8 controls) vs `--profile full` (all items/modes) and `--items-per-category`.
+  - Incremental `checkpoint.jsonl` persistence with `--resume`, `--concurrency`, configurable `--timeout` (default `120s`), and live per-prompt progress output (`--quiet` to suppress).
+
 ## [0.1.0] - 2026-11-26
 
 ### Added
