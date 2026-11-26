@@ -14,6 +14,8 @@ from beliefaudit.golden.rubric import (
 )
 from beliefaudit.probes.generator import extract_code_block, extract_json_payload
 from beliefaudit.schemas import (
+    AuditProfile,
+    AuditScorecard,
     GoldenItem,
     GoldenSnapshot,
     ProbeMode,
@@ -192,10 +194,26 @@ def compute_belief_delta_against_golden(
         key=lambda m: list(ProbeMode).index(m),
     ) or list(ProbeMode)
 
+    scorecard_path = resolved_run / "scorecard.json"
+    is_quick_run = False
+    if scorecard_path.is_file():
+        sc = AuditScorecard.model_validate_json(scorecard_path.read_text(encoding="utf-8"))
+        is_quick_run = sc.audit_profile == AuditProfile.QUICK
+
+    target_items = (
+        [
+            item
+            for item in snapshot.items
+            if any((item.item_id, m) in base_claims for m in evaluated_modes)
+        ]
+        if is_quick_run and base_claims
+        else snapshot.items
+    )
+
     operations: list[DeltaOperation] = []
     unchanged_item_ids: list[str] = []
 
-    for item in snapshot.items:
+    for item in target_items:
         item_evaluated = any((item.item_id, m) in base_claims for m in evaluated_modes)
         item_had_op = False
 
