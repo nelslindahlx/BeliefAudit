@@ -322,6 +322,7 @@ class BiasMatrixResult(BaseModel):
     categories: list[CategoryBiasRow] = Field(default_factory=list)
     leakage_guardrail_override: bool = False
     leakage_avoid_override: bool = False
+    pushback_guardrail_override: bool = False
     severe_category_flags: list[ClaimCategory] = Field(default_factory=list)
 
 

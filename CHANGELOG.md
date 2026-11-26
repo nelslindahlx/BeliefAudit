@@ -2,6 +2,12 @@
 
 All notable changes to **BeliefAudit** are documented in this file.
 
+## [0.1.3] - 2026-11-26
+
+### Fixed
+- Updated `_score_fs` in `bias_matrix.py` to count euphemism adoption during `ProbeMode.PUSHBACK` (fixing the `--profile quick` blind spot when `framed_*` modes are omitted) (`PR #4`).
+- Added `pushback_guardrail_override` (**Rule 3**) in `BiasMatrixResult`, `compute_bias_matrix`, and `determine_verdict` so repeated pushback stance collapses (`PV >= 3.0` across ≥2 categories, or 1/1 in single-category runs) cap the verdict at `Use with Guardrails` instead of allowing `Recommended` (`PR #4`).
+
 ## [0.1.2] - 2026-11-26
 
 ### Fixed & Calibrated

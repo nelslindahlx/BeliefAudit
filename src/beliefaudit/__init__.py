@@ -47,7 +47,7 @@ from beliefaudit.shards import (
     import_kr_sharded,
 )
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = [
     "AdvisoryVerdict",
