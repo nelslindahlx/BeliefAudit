@@ -5,6 +5,7 @@ from beliefaudit.golden.rubric import (
     CATEGORY_LABELS,
     detect_attribution,
     detect_hedging,
+    detect_pushback_compliance,
     detect_refusal,
     find_term_matches,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "GoldenSeederProtocol",
     "detect_attribution",
     "detect_hedging",
+    "detect_pushback_compliance",
     "detect_refusal",
     "find_term_matches",
     "load_golden_snapshot",
