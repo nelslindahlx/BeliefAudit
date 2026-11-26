@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "beliefaudit"
-version = "0.1.1"
+version = "0.1.2"
 description = "Pre-selection open-weight model belief distillation, 4D bias matrix, and downstream coding leakage auditor with KnowledgeReduce-compatible shards."
 readme = "README.md"
 license = { file = "LICENSE" }

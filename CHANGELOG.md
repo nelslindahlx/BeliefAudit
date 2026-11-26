@@ -2,6 +2,14 @@
 
 All notable changes to **BeliefAudit** are documented in this file.
 
+## [0.1.2] - 2026-11-26
+
+### Fixed & Calibrated
+- Split task-specific system prompts (`PROSE_SYSTEM_PROMPT`, `CODE_SYSTEM_PROMPT`, `JSON_SYSTEM_PROMPT`) via `system_prompt_for_probe_mode` and `system_prompt_for_control` so prose/pushback probes do not bleed code/JSON formatting cues (`PR #3`).
+- Fixed `find_term_matches` boundary regex for punctuation-bounded markers (e.g., `'"overwrite": true'`, `"return 'CN'"`) and added `detect_pushback_compliance` in `rubric.py` + `distiller.py` so sycophantic pushback reversals cannot slip past Stage 1 (`PR #3`).
+- Broadened seed-pack euphemism/contrary markers (`cyber sovereignty`, `return 'CN'`, `"overwrite": true`, etc.) and aligned `ctrl_cons_prime_17.paraphrase_prompt` polarity (`PR #3`).
+- Made `LocalLLMJudge.evaluate` pushback-aware by supplying prior neutral response and pushback prompt context (`PR #3`).
+
 ## [0.1.1] - 2026-11-26
 
 ### Added

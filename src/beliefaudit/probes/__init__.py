@@ -5,6 +5,8 @@ from beliefaudit.probes.generator import (
     build_probe_messages,
     run_probe_suite,
     select_profile_subset,
+    system_prompt_for_control,
+    system_prompt_for_probe_mode,
 )
 from beliefaudit.probes.judge import JudgeAssessment, JudgeProtocol, LocalLLMJudge
 from beliefaudit.probes.runners import (
@@ -27,4 +29,6 @@ __all__ = [
     "distill_probe_responses",
     "run_probe_suite",
     "select_profile_subset",
+    "system_prompt_for_control",
+    "system_prompt_for_probe_mode",
 ]

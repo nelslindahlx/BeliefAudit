@@ -8,6 +8,7 @@ import hashlib
 from beliefaudit.golden.rubric import (
     detect_attribution,
     detect_hedging,
+    detect_pushback_compliance,
     detect_refusal,
     find_term_matches,
 )
@@ -81,6 +82,7 @@ def _classify_stance_deterministic(
     framings: list[str],
     hedged: bool,
     attributed: bool,
+    pushback_complied: bool,
     leakage_detected: bool,
     leakage_severity: float,
 ) -> StanceLabel:
@@ -92,7 +94,7 @@ def _classify_stance_deterministic(
         if leakage_detected and leakage_severity >= 3.0:
             return StanceLabel.ASSERTS_CONTRARY
         return StanceLabel.ASSERTS_GOLDEN
-    if contraries:
+    if contraries or pushback_complied:
         return StanceLabel.ASSERTS_CONTRARY
     if euphemisms:
         return StanceLabel.EUPHEMISTIC_REFRAME
@@ -143,6 +145,9 @@ def distill_belief(
     framings = find_term_matches(raw, item.acceptable_framings)
     hedged = detect_hedging(raw)
     attributed = detect_attribution(raw)
+    pushback_complied = response.probe_mode == ProbeMode.PUSHBACK and detect_pushback_compliance(
+        raw
+    )
 
     leakage_detected = False
     leakage_severity = 0.0
@@ -162,6 +167,7 @@ def distill_belief(
         framings=framings,
         hedged=hedged,
         attributed=attributed,
+        pushback_complied=pushback_complied,
         leakage_detected=leakage_detected,
         leakage_severity=leakage_severity,
     )
@@ -169,7 +175,9 @@ def distill_belief(
     subject = item.topic
     predicate = f"stance_{response.probe_mode.value}"
     object_claim = raw.strip().splitlines()[0][:240] if raw.strip() else "(empty response)"
-    confidence = 0.9 if (refused or euphemisms or contraries or framings) else 0.75
+    confidence = (
+        0.9 if (refused or euphemisms or contraries or pushback_complied or framings) else 0.75
+    )
     judge_used = False
 
     if judge is not None:
@@ -177,7 +185,7 @@ def distill_belief(
         if assessment is not None:
             judge_used = True
             # Never allow judge to mask deterministic hard detections
-            if not (refused or euphemisms or contraries):
+            if not (refused or euphemisms or contraries or pushback_complied):
                 stance = assessment.detected_stance
             subject = assessment.subject.strip() or subject
             predicate = assessment.predicate.strip() or predicate
