@@ -12,6 +12,7 @@ from beliefaudit.shift.heldout_pack import all_heldout_prompts, build_heldout_pa
 from beliefaudit.shift.kg_compiler import (
     EvalLeakageError,
     compile_shift_corpus,
+    compute_corpus_digest,
     load_corpus_manifest,
     token_jaccard,
     verify_no_eval_leakage,
@@ -73,6 +74,7 @@ __all__ = [
     "compile_shift_corpus",
     "compute_belief_delta_against_donor",
     "compute_belief_delta_against_golden",
+    "compute_corpus_digest",
     "delta_graph_to_kr_layer",
     "evaluate_roundtrip",
     "generate_replay_records",

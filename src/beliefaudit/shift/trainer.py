@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
-from beliefaudit.security import BeliefAuditError, ensure_within_base
-from beliefaudit.shift.kg_compiler import load_corpus_manifest
+from beliefaudit.security import BeliefAuditError, ensure_within_base, sanitize_layer_id
+from beliefaudit.shift._io import write_text_atomic
+from beliefaudit.shift.kg_compiler import compute_corpus_digest, load_corpus_manifest
 from beliefaudit.shift.schemas import (
     BeliefDeltaGraph,
     CompiledCorpusManifest,
+    DpoPreferencePair,
     LoRAShardManifest,
     SftTrainingRecord,
     TrainingBackend,
@@ -22,17 +27,81 @@ class ShiftTrainerError(BeliefAuditError):
     """Raised when corpus validation or LoRA backend invocation fails."""
 
 
-def _scripts_dir() -> Path:
-    return Path(__file__).resolve().parents[3] / "scripts"
+def _resolve_training_script(script_name: str, scripts_dir: Path | None = None) -> Path:
+    """Locate standalone training script from explicit dir, source checkout, or cwd."""
+    candidates: list[Path] = []
+    if scripts_dir is not None:
+        candidates.append(scripts_dir / script_name)
+    else:
+        candidates.append(Path(__file__).resolve().parents[3] / "scripts" / script_name)
+        candidates.append(Path.cwd() / "scripts" / script_name)
+    for cand in candidates:
+        resolved = cand.resolve()
+        if resolved.is_file():
+            return resolved
+    searched = ", ".join(str(c) for c in candidates)
+    raise ShiftTrainerError(
+        f"Training helper script {script_name!r} not found (searched: {searched}). "
+        "Run from the BeliefAudit source checkout or pass scripts_dir."
+    )
+
+
+def _validate_sft_jsonl(path: Path) -> int:
+    if not path.is_file():
+        raise ShiftTrainerError(f"Missing compiled SFT file: {path}")
+    rows = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not rows:
+        raise ShiftTrainerError(f"Compiled training file {path} is empty.")
+    for idx, line in enumerate(rows, start=1):
+        try:
+            SftTrainingRecord.model_validate_json(line)
+        except Exception as exc:
+            raise ShiftTrainerError(
+                f"Invalid SftTrainingRecord at line {idx} in {path}: {exc}"
+            ) from exc
+    return len(rows)
+
+
+def _validate_mlx_messages_jsonl(path: Path) -> int:
+    if not path.is_file():
+        raise ShiftTrainerError(f"Missing compiled MLX file: {path}")
+    rows = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not rows:
+        raise ShiftTrainerError(f"Compiled MLX file {path} is empty.")
+    for idx, line in enumerate(rows, start=1):
+        try:
+            raw: Any = json.loads(line)
+            if not isinstance(raw, dict) or not isinstance(raw.get("messages"), list):
+                raise ValueError("missing 'messages' list")
+        except Exception as exc:
+            raise ShiftTrainerError(f"Invalid MLX record at line {idx} in {path}: {exc}") from exc
+    return len(rows)
+
+
+def _validate_dpo_jsonl(path: Path, *, required_non_empty: bool) -> int:
+    if not path.is_file():
+        raise ShiftTrainerError(f"Missing compiled DPO file: {path}")
+    rows = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if required_non_empty and not rows:
+        raise ShiftTrainerError(f"Compiled DPO file {path} is empty.")
+    for idx, line in enumerate(rows, start=1):
+        try:
+            DpoPreferencePair.model_validate_json(line)
+        except Exception as exc:
+            raise ShiftTrainerError(
+                f"Invalid DpoPreferencePair at line {idx} in {path}: {exc}"
+            ) from exc
+    return len(rows)
 
 
 def validate_corpus_for_training(
     corpus_dir: Path | str,
     *,
     min_replay_ratio: float = 0.25,
+    require_dpo: bool = False,
     base_dir: Path | str | None = None,
 ) -> CompiledCorpusManifest:
-    """Validate compiled corpus manifest, leakage gate, replay ratio, and JSONL schema."""
+    """Validate corpus manifest, leakage gate, replay ratio, JSONL schemas, and SHA-256 digest."""
     manifest = load_corpus_manifest(corpus_dir, base_dir=base_dir)
     if not manifest.leakage_check_passed:
         raise ShiftTrainerError("Refusing to train: corpus failed anti-leakage gate.")
@@ -40,20 +109,26 @@ def validate_corpus_for_training(
         raise ShiftTrainerError(
             f"Replay ratio {manifest.replay_ratio:.2f} is below safety floor {min_replay_ratio:.2f}."
         )
+
     sft_train = Path(manifest.sft_train_path)
-    mlx_train = Path(manifest.mlx_data_dir) / "train.jsonl"
-    if not sft_train.is_file() or not mlx_train.is_file():
-        raise ShiftTrainerError(f"Missing compiled training JSONL files for {manifest.corpus_id}.")
-    rows = [
-        line.strip() for line in sft_train.read_text(encoding="utf-8").splitlines() if line.strip()
-    ]
-    if not rows:
-        raise ShiftTrainerError(f"Compiled training file {sft_train} is empty.")
-    for idx, line in enumerate(rows, start=1):
-        try:
-            SftTrainingRecord.model_validate_json(line)
-        except Exception as exc:
-            raise ShiftTrainerError(f"Invalid SftTrainingRecord at line {idx}: {exc}") from exc
+    sft_valid = Path(manifest.sft_valid_path)
+    dpo_pairs = Path(manifest.dpo_pairs_path)
+    mlx_dir = Path(manifest.mlx_data_dir)
+    mlx_train = mlx_dir / "train.jsonl"
+    mlx_valid = mlx_dir / "valid.jsonl"
+
+    _validate_sft_jsonl(sft_train)
+    _validate_sft_jsonl(sft_valid)
+    _validate_mlx_messages_jsonl(mlx_train)
+    _validate_mlx_messages_jsonl(mlx_valid)
+    _validate_dpo_jsonl(dpo_pairs, required_non_empty=require_dpo)
+
+    actual_digest = compute_corpus_digest(sft_train, sft_valid, dpo_pairs, mlx_train, mlx_valid)
+    if manifest.content_sha256 != actual_digest:
+        raise ShiftTrainerError(
+            f"Compiled corpus digest mismatch for {manifest.corpus_id}: "
+            "artifacts were modified after compilation."
+        )
     return manifest
 
 
@@ -71,11 +146,12 @@ def build_training_command(
     batch_size: int = 2,
     run_dpo: bool = False,
     dry_run: bool = True,
+    scripts_dir: Path | None = None,
 ) -> list[str]:
     """Construct the exact Python CLI command for the selected LoRA backend."""
     adapter_dir = out_shard_dir / "adapter"
     if backend == TrainingBackend.PEFT:
-        script = str(_scripts_dir() / "train_peft.py")
+        script = str(_resolve_training_script("train_peft.py", scripts_dir=scripts_dir))
         cmd = [
             sys.executable,
             script,
@@ -86,7 +162,7 @@ def build_training_command(
             "--output-dir",
             str(adapter_dir),
             "--epochs",
-            str(max(1, iters_or_epochs if iters_or_epochs <= 10 else 2)),
+            str(max(1, iters_or_epochs)),
             "--batch-size",
             str(batch_size),
             "--lr",
@@ -103,7 +179,7 @@ def build_training_command(
         return cmd
 
     # Default / MLX command (for DRY_RUN we emit the MLX command as the local reference)
-    script = str(_scripts_dir() / "train_mlx.py")
+    script = str(_resolve_training_script("train_mlx.py", scripts_dir=scripts_dir))
     cmd = [
         sys.executable,
         script,
@@ -123,6 +199,8 @@ def build_training_command(
         str(lora_layers),
         "--lora-rank",
         str(lora_rank),
+        "--lora-alpha",
+        str(lora_alpha),
     ]
     if dry_run or backend == TrainingBackend.DRY_RUN:
         cmd.append("--dry-run")
@@ -146,10 +224,14 @@ def run_shift_training(
     dry_run: bool = False,
     min_replay_ratio: float = 0.25,
     base_dir: Path | str | None = None,
+    scripts_dir: Path | None = None,
 ) -> LoRAShardManifest:
     """Validate corpus, write LoRAShardManifest, and invoke backend (or dry-run)."""
     manifest = validate_corpus_for_training(
-        corpus_dir, min_replay_ratio=min_replay_ratio, base_dir=base_dir
+        corpus_dir,
+        min_replay_ratio=min_replay_ratio,
+        require_dpo=(run_dpo and backend == TrainingBackend.PEFT),
+        base_dir=base_dir,
     )
     target_dir = (
         ensure_within_base(out_shard_dir, base_dir)
@@ -172,6 +254,7 @@ def run_shift_training(
         batch_size=batch_size,
         run_dpo=run_dpo,
         dry_run=effective_dry_run,
+        scripts_dir=scripts_dir,
     )
 
     if backend != TrainingBackend.DRY_RUN:
@@ -189,7 +272,9 @@ def run_shift_training(
     lora_manifest = LoRAShardManifest(
         shard_id=shard_id,
         base_model_id=base_model_id,
-        source_belief_shard_id=f"beliefs-{delta.base_model_id}-{delta.golden_version}",
+        source_belief_shard_id=sanitize_layer_id(
+            f"beliefs-{delta.base_model_id}-{delta.golden_version}"
+        ),
         target_kind=delta.target_kind,
         target_id=delta.target_id,
         delta_id=delta.delta_id,
@@ -212,13 +297,13 @@ def run_shift_training(
         if backend != TrainingBackend.PEFT
         else f"vllm serve {base_model_id} --enable-lora --lora-modules belief_shift={adapter_dir} --port 8000"
     )
-    (target_dir / "train_command.txt").write_text(
+    write_text_atomic(
         "# Train command:\n"
-        + " ".join(cmd)
+        + shlex.join(cmd)
         + "\n\n# Local OpenAI-compatible serving command for `beliefaudit shift verify`:\n"
         + serve_hint
         + "\n",
-        encoding="utf-8",
+        target_dir / "train_command.txt",
     )
     return lora_manifest
 
@@ -235,8 +320,7 @@ def save_lora_manifest(
         if base_dir is not None
         else Path(output_path).resolve()
     )
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    write_text_atomic(manifest.model_dump_json(indent=2) + "\n", target)
     return target
 
 

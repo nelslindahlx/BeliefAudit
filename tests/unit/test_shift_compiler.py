@@ -94,12 +94,47 @@ def test_compile_shift_corpus_6_views_adaptive_replay_and_mlx_jsonl(tmp_path: Pa
     assert manifest.leakage_check_passed is True
     assert manifest.max_eval_overlap_jaccard < 0.75
     assert manifest.replay_ratio >= 0.45
-    assert manifest.dpo_pair_count == len(delta.operations)
+    assert manifest.dpo_pair_count >= len({op.item_id for op in delta.operations})
     assert manifest.sft_train_count > 0
     assert manifest.sft_valid_count > 0
 
+    # Portable relative paths stored on disk; resolved cleanly on load
+    raw_manifest = json.loads((corpus_dir / "corpus_manifest.json").read_text(encoding="utf-8"))
+    assert raw_manifest["sft_train_path"] == "sft_train.jsonl"
+    assert raw_manifest["mlx_data_dir"] == "mlx_data"
+
+    # Zero disallowed euphemisms in any compiled assistant message or DPO chosen response
+    from beliefaudit.golden.rubric import detect_refusal, find_term_matches
+
+    item_by_id = {i.item_id: i for i in snap.items}
+    seen_sft_msgs: list[str] = []
+    for jsonl_path in (Path(manifest.sft_train_path), Path(manifest.sft_valid_path)):
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+            rec = SftTrainingRecord.model_validate_json(line)
+            seen_sft_msgs.append(json.dumps([m.model_dump() for m in rec.messages], sort_keys=True))
+            if not rec.metadata.get("is_replay"):
+                item = item_by_id[str(rec.metadata["item_id"])]
+                for msg in rec.messages:
+                    if msg.role == "assistant":
+                        assert not detect_refusal(msg.content)
+                        assert not find_term_matches(msg.content, item.disallowed_euphemisms)
+
+    # Zero duplicate SFT rows across train and valid
+    assert len(seen_sft_msgs) == len(set(seen_sft_msgs))
+
     reloaded = load_corpus_manifest(corpus_dir)
     assert reloaded.corpus_id == manifest.corpus_id
+
+    # Escape attempt in corpus_manifest.json is rejected
+    from beliefaudit.security import BeliefAuditSecurityError
+
+    escaped_dir = tmp_path / "escaped_corpus"
+    escaped_dir.mkdir()
+    escaped_raw = dict(raw_manifest)
+    escaped_raw["sft_train_path"] = "../outside.jsonl"
+    (escaped_dir / "corpus_manifest.json").write_text(json.dumps(escaped_raw), encoding="utf-8")
+    with pytest.raises(BeliefAuditSecurityError):
+        load_corpus_manifest(escaped_dir)
 
     mlx_train = Path(manifest.mlx_data_dir) / "train.jsonl"
     assert mlx_train.is_file()
@@ -234,9 +269,83 @@ def test_expander_model_fail_closed_filtering_and_cli_compile(tmp_path: Path) ->
             )
             assert manifest.leakage_check_passed is True
 
-    # Invalid valid_ratio or missing delta file triggers error
+    # Invalid valid_ratio (including 0.0) or missing delta file triggers error
     with pytest.raises(ValueError):
         compile_shift_corpus(delta_one, snap, tmp_path / "bad_ratio", valid_ratio=0.9)
+    with pytest.raises(ValueError):
+        compile_shift_corpus(delta_one, snap, tmp_path / "zero_ratio", valid_ratio=0.0)
+
+    # Leaked custom replay raises EvalLeakageError inside compile_shift_corpus
+    leaked_custom = tmp_path / "leaked_custom_replay.jsonl"
+    leaked_custom.write_text(
+        SftTrainingRecord(
+            messages=[
+                ChatMessage(role="system", content=PROSE_SYSTEM_PROMPT),
+                ChatMessage(role="user", content=snap.items[0].neutral_prompt),
+                ChatMessage(role="assistant", content="Leaked prompt."),
+            ]
+        ).model_dump_json()
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(EvalLeakageError):
+        compile_shift_corpus(
+            delta_one, snap, tmp_path / "leaked_corpus", custom_replay_path=leaked_custom
+        )
+
+    # _verify_assistant_hygiene rejects refusal or disallowed euphemism in assistant/chosen outputs
+    from beliefaudit.shift.kg_compiler import _verify_assistant_hygiene
+    from beliefaudit.shift.schemas import DpoPreferencePair
+
+    bad_sft = SftTrainingRecord(
+        messages=[
+            ChatMessage(role="system", content=PROSE_SYSTEM_PROMPT),
+            ChatMessage(role="user", content="Safe question."),
+            ChatMessage(role="assistant", content=f"Actually it is a {bad_euph}."),
+        ],
+        metadata={"item_id": first_item.item_id, "is_replay": False},
+    )
+    with pytest.raises(EvalLeakageError):
+        _verify_assistant_hygiene([bad_sft], [], {first_item.item_id: first_item})
+
+    bad_dpo = DpoPreferencePair(
+        prompt="Safe prompt.",
+        chosen="I cannot answer this topic because it is sensitive.",
+        rejected="Some bad output.",
+        metadata={"item_id": first_item.item_id},
+    )
+    with pytest.raises(EvalLeakageError):
+        _verify_assistant_hygiene([], [bad_dpo], {first_item.item_id: first_item})
+
+    # Mode-matched DPO pairs for DE_LEAK (downstream_code / downstream_extract)
+    leaker_dir = tmp_path / "run_leaker"
+    assert (
+        cli.invoke(
+            app,
+            [
+                "run",
+                "--mock",
+                "leaker",
+                "--profile",
+                "quick",
+                "--quiet",
+                "--golden",
+                str(golden_path),
+                "--out-dir",
+                str(leaker_dir),
+            ],
+        ).exit_code
+        == 0
+    )
+    leaker_delta = compute_belief_delta_against_golden(leaker_dir, snap)
+    leaker_corpus = compile_shift_corpus(leaker_delta, snap, tmp_path / "leaker_corpus")
+    dpo_lines = [
+        json.loads(line)
+        for line in Path(leaker_corpus.dpo_pairs_path).read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(row["metadata"]["view_type"] == "dpo_contrastive_code" for row in dpo_lines)
+    assert any(row["metadata"]["view_type"] == "dpo_contrastive_extract" for row in dpo_lines)
+
     assert (
         cli.invoke(
             app,
@@ -253,4 +362,3 @@ def test_expander_model_fail_closed_filtering_and_cli_compile(tmp_path: Path) ->
         ).exit_code
         == 1
     )
-    assert EvalLeakageError("x") is not None

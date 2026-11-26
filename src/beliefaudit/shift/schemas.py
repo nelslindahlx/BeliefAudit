@@ -114,6 +114,7 @@ class BeliefDeltaGraph(BaseModel):
             "golden_version": self.golden_version,
             "golden_digest": self.golden_digest,
             "operations": [op.model_dump(mode="json") for op in self.operations],
+            "operations_summary": {k.value: v for k, v in self.operations_summary.items()},
             "unchanged_item_ids": self.unchanged_item_ids,
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -121,11 +122,13 @@ class BeliefDeltaGraph(BaseModel):
 
     @model_validator(mode="after")
     def _populate_summary_and_digest(self) -> BeliefDeltaGraph:
+        expected_summary: dict[ShiftOperationType, int] = {op_t: 0 for op_t in ShiftOperationType}
+        for op in self.operations:
+            expected_summary[op.operation_type] = expected_summary.get(op.operation_type, 0) + 1
         if not self.operations_summary:
-            summary: dict[ShiftOperationType, int] = {op_t: 0 for op_t in ShiftOperationType}
-            for op in self.operations:
-                summary[op.operation_type] = summary.get(op.operation_type, 0) + 1
-            self.operations_summary = summary
+            self.operations_summary = expected_summary
+        elif self.operations_summary != expected_summary:
+            raise ValueError("operations_summary does not match operations counts.")
         if not self.content_sha256:
             self.content_sha256 = self.compute_digest()
         return self

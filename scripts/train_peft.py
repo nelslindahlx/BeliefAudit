@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Decoupled CUDA PEFT/TRL LoRA SFT + optional Stage 3B DPO trainer for BeliefShift.
 
-Heavy ML libraries (`torch`, `transformers`, `peft`, `trl`, `datasets`) are
+Heavy ML dependencies (`torch`, `transformers`, `peft`, `trl`, `datasets`) are
 imported lazily ONLY after dataset validation and `--dry-run`.
 """
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_args(args: argparse.Namespace) -> None:
+    if args.lora_r < 1:
+        raise ValueError(f"--lora-r must be >= 1 (got {args.lora_r}).")
+    if args.lora_alpha < 1:
+        raise ValueError(f"--lora-alpha must be >= 1 (got {args.lora_alpha}).")
+    if args.epochs < 1:
+        raise ValueError(f"--epochs must be >= 1 (got {args.epochs}).")
+    if args.batch_size < 1:
+        raise ValueError(f"--batch-size must be >= 1 (got {args.batch_size}).")
+    if args.grad_accum < 1:
+        raise ValueError(f"--grad-accum must be >= 1 (got {args.grad_accum}).")
+    if args.lr <= 0.0:
+        raise ValueError(f"--lr must be > 0 (got {args.lr}).")
+
+
 def _load_jsonl(path: Path, required_keys: tuple[str, ...]) -> list[dict[str, Any]]:
     if not path.is_file():
         raise FileNotFoundError(f"Dataset file not found: {path}")
@@ -55,6 +71,7 @@ def _load_jsonl(path: Path, required_keys: tuple[str, ...]) -> list[dict[str, An
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
+        _validate_args(args)
         sft_rows = _load_jsonl(Path(args.dataset), ("messages",))
         dpo_rows = (
             _load_jsonl(Path(args.dpo_dataset), ("prompt", "chosen", "rejected"))
@@ -75,10 +92,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         if dpo_rows:
             print(f"[dry-run] Stage 3B DPOTrainer: {len(dpo_rows)} contrastive pairs")
-        print(
-            "[dry-run] Serve after training:",
-            f"vllm serve {args.base_model} --enable-lora --lora-modules belief_shift={args.output_dir} --port 8000",
+        serve_cmd = shlex.join(
+            [
+                "vllm",
+                "serve",
+                args.base_model,
+                "--enable-lora",
+                "--lora-modules",
+                f"belief_shift={args.output_dir}",
+                "--port",
+                "8000",
+            ]
         )
+        print("[dry-run] Serve after training:", serve_cmd)
         return 0
 
     try:
@@ -88,9 +114,13 @@ def main(argv: list[str] | None = None) -> int:
         from transformers import (  # type: ignore[import-not-found]
             AutoModelForCausalLM,
             AutoTokenizer,
-            TrainingArguments,
         )
-        from trl import DPOConfig, DPOTrainer, SFTTrainer  # type: ignore[import-not-found]
+        from trl import (  # type: ignore[import-not-found]
+            DPOConfig,
+            DPOTrainer,
+            SFTConfig,
+            SFTTrainer,
+        )
     except ImportError as exc:
         print(
             f"Training dependencies missing ({exc}). Install: pip install torch transformers peft trl datasets accelerate",
@@ -120,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     )
     use_bf16 = bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported())
-    sft_args = TrainingArguments(
+    sft_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -130,20 +160,24 @@ def main(argv: list[str] | None = None) -> int:
         save_strategy="epoch",
         bf16=use_bf16,
         report_to="none",
+        dataset_text_field="text",
+        max_length=args.max_seq_len,
     )
     trainer = SFTTrainer(
         model=model,
         args=sft_args,
         train_dataset=sft_ds,
         peft_config=peft_cfg,
-        dataset_text_field="text",
-        max_seq_length=args.max_seq_len,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
     )
     trainer.train()
 
     if dpo_rows:
-        dpo_ds = Dataset.from_list(dpo_rows)
+        clean_dpo = [
+            {"prompt": r["prompt"], "chosen": r["chosen"], "rejected": r["rejected"]}
+            for r in dpo_rows
+        ]
+        dpo_ds = Dataset.from_list(clean_dpo)
         dpo_args = DPOConfig(
             output_dir=args.output_dir,
             num_train_epochs=1,
@@ -154,9 +188,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         dpo_trainer = DPOTrainer(
             model=trainer.model,
+            ref_model=None,
             args=dpo_args,
             train_dataset=dpo_ds,
-            tokenizer=tokenizer,
+            processing_class=tokenizer,
         )
         dpo_trainer.train()
         dpo_trainer.save_model(args.output_dir)

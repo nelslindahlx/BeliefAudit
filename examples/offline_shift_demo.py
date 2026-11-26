@@ -8,6 +8,7 @@ from pathlib import Path
 from beliefaudit import (
     AuditProfile,
     BundledOfflineSeeder,
+    GoldenSnapshot,
     MockModelRunner,
     TrainingBackend,
     beliefs_to_kr_layer,
@@ -30,12 +31,9 @@ from beliefaudit.scoring.advisor import write_audit_artifacts
 
 def _audit_persona(
     persona: MockPersona,
-    full_snapshot: object,
+    full_snapshot: GoldenSnapshot,
     out_dir: Path,
 ) -> None:
-    from beliefaudit.schemas import GoldenSnapshot
-
-    assert isinstance(full_snapshot, GoldenSnapshot)
     subset, modes = select_profile_subset(full_snapshot, AuditProfile.QUICK)
     runner = MockModelRunner(persona=persona, snapshot=full_snapshot)
     probes, ctrls = run_probe_suite(runner, subset, modes=modes)

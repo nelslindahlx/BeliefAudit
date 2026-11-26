@@ -117,6 +117,8 @@ def test_compute_delta_against_donor_and_poisoning_guard(tmp_path: Path) -> None
         op.item_id == first_item and op.probe_mode.value == "neutral"
         for op in guarded_delta.operations
     )
+    # Failing base item blocked by donor guard must NOT be misclassified as unchanged/clean
+    assert first_item not in guarded_delta.unchanged_item_ids
 
 
 def test_delta_persistence_kr_export_and_cli(tmp_path: Path) -> None:
@@ -224,3 +226,58 @@ def test_delta_persistence_kr_export_and_cli(tmp_path: Path) -> None:
         ],
     )
     assert bad_cli.exit_code == 1
+
+
+def test_delta_subset_profile_distinct_ids_and_summary_digest(tmp_path: Path) -> None:
+    snap = BundledOfflineSeeder().seed("v0.1.0")
+    golden_path = save_golden_snapshot(snap, tmp_path / "golden.json")
+
+    # --profile full --items-per-category 1 is a subset run -> no false INJECT ops on skipped items
+    subset_dir = tmp_path / "run_clean_full_cap1"
+    res = cli.invoke(
+        app,
+        [
+            "run",
+            "--mock",
+            "clean",
+            "--profile",
+            "full",
+            "--items-per-category",
+            "1",
+            "--quiet",
+            "--golden",
+            str(golden_path),
+            "--out-dir",
+            str(subset_dir),
+        ],
+    )
+    assert res.exit_code == 0, res.stderr
+    subset_delta = compute_belief_delta_against_golden(subset_dir, snap)
+    assert len(subset_delta.operations) == 0
+    assert len(subset_delta.unchanged_item_ids) == 6
+
+    # quick vs full delta_ids must differ on the same base model and golden set
+    skewed_quick = _run_mock_audit(tmp_path, golden_path, "skewed", profile="quick")
+    skewed_full = _run_mock_audit(tmp_path, golden_path, "skewed", profile="full")
+    d_quick = compute_belief_delta_against_golden(skewed_quick, snap)
+    d_full = compute_belief_delta_against_golden(skewed_full, snap)
+    assert d_quick.delta_id != d_full.delta_id
+
+    # Mismatched operations_summary fails validation and mutation invalidates digest
+    from pydantic import ValidationError
+
+    from beliefaudit.shift.schemas import BeliefDeltaGraph
+
+    with pytest.raises(ValidationError):
+        BeliefDeltaGraph(
+            delta_id="delta_bad",
+            base_model_id="m",
+            target_kind=ShiftTargetKind.GOLDEN_SET,
+            target_id="golden:v0.1.0",
+            golden_version="v0.1.0",
+            golden_digest=snap.content_sha256,
+            operations=d_quick.operations,
+            operations_summary={ShiftOperationType.INJECT: 99},
+        )
+    d_quick.operations_summary[ShiftOperationType.CORRECT] += 10
+    assert d_quick.verify_digest() is False

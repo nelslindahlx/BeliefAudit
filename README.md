@@ -57,16 +57,16 @@ uv run beliefaudit run \
   --golden shards/golden_v0.1.0.json \
   --out-dir runs/qwen2.5-14b/
 
-# 4. Inspect scorecards & belief conflicts from a completed run
+# 5. Inspect scorecards & belief conflicts from a completed run
 uv run beliefaudit inspect --run-dir runs/mock_clean/
 
-# 5. Diff two model belief shards against the same Golden Set
+# 6. Diff two model belief shards against the same Golden Set
 uv run beliefaudit diff \
   --baseline runs/model_a/belief_shard.json \
   --candidate runs/model_b/belief_shard.json \
   --golden shards/golden_v0.1.0.json
 
-# 6. Promote flagged candidate discoveries to golden_v0.2.0
+# 7. Promote flagged candidate discoveries to golden_v0.2.0
 uv run beliefaudit golden promote \
   --current shards/golden_v0.1.0.json \
   --candidates runs/qwen2.5-14b/golden_candidates_pending.json \
