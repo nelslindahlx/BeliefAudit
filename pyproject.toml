@@ -61,6 +61,10 @@ Issues = "https://github.com/nelslindahlx/BeliefAudit/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/beliefaudit"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"scripts/train_mlx.py" = "beliefaudit/shift/scripts/train_mlx.py"
+"scripts/train_peft.py" = "beliefaudit/shift/scripts/train_peft.py"
+
 [tool.hatch.build.targets.sdist]
 exclude = [
   ".venv/**",

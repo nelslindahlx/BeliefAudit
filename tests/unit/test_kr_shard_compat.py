@@ -94,3 +94,8 @@ def test_diff_engine_detects_conflicts_and_model_regressions() -> None:
     summary = diff_model_shards(clean_layer, skewed_layer, snap)
     assert summary.regression_count > 0
     assert summary.total_compared == len(clean_beliefs)
+
+    # Euphemisms always flag needs_review=True even if detected_stance looks clean
+    hybrid_euph = clean_beliefs[0].model_copy(update={"euphemisms_detected": ["renegade province"]})
+    hybrid_layer = beliefs_to_kr_layer("hybrid-euph", snap.golden_version, [hybrid_euph])
+    assert hybrid_layer.claims[0].needs_review is True

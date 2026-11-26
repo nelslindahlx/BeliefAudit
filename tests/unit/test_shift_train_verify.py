@@ -109,11 +109,27 @@ def test_trainer_dry_run_validation_and_scripts(tmp_path: Path) -> None:
         backend=TrainingBackend.PEFT,
         iters_or_epochs=3,
         run_dpo=True,
+        dpo_beta=0.05,
+        dpo_lr_scale=0.1,
         dry_run=True,
     )
     assert peft_manifest.iters_or_epochs == 3
     assert "--epochs" in peft_manifest.executed_command
     assert "3" in peft_manifest.executed_command
+    assert "--dpo-beta" in peft_manifest.executed_command
+    assert "0.05" in peft_manifest.executed_command
+
+    # Fail closed when --dpo is passed to --backend mlx
+    with pytest.raises(ShiftTrainerError, match="supported only with --backend peft"):
+        run_shift_training(
+            corpus_dir=corpus_dir,
+            delta=delta,
+            base_model_id="mlx-community/Qwen2.5-7B-Instruct-4bit",
+            out_shard_dir=tmp_path / "mlx_dpo_bad",
+            backend=TrainingBackend.MLX,
+            run_dpo=True,
+            dry_run=True,
+        )
 
     # Run both standalone scripts with --dry-run (zero ML imports, zero GPU)
     mlx_cmd = build_training_command(
@@ -247,6 +263,22 @@ def test_trainer_dry_run_validation_and_scripts(tmp_path: Path) -> None:
         check=False,
     )
     assert bad_peft.returncode == 1
+    bad_beta = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "scripts/train_peft.py",
+            "--dataset",
+            manifest.sft_train_path,
+            "--dpo-beta",
+            "0",
+            "--dry-run",
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert bad_beta.returncode == 1
 
 
 def test_roundtrip_verify_pass_quality_fail_drift_and_parrot_warning(tmp_path: Path) -> None:
@@ -491,6 +523,51 @@ def test_roundtrip_verify_pass_quality_fail_drift_and_parrot_warning(tmp_path: P
         ],
     )
     assert res_post.exit_code == 1
+
+    # CLI verify --post-run + --mock clean runs held-out probes against mock while reusing artifacts
+    res_post_ho = cli.invoke(
+        app,
+        [
+            "shift",
+            "verify",
+            "--delta",
+            str(delta_path),
+            "--pre-run",
+            str(pre_dir),
+            "--post-run",
+            str(verify_dir / "post_audit"),
+            "--mock",
+            "clean",
+            "--golden",
+            str(golden_path),
+            "--out-dir",
+            str(tmp_path / "verify_post_ho"),
+        ],
+    )
+    assert res_post_ho.exit_code == 0, res_post_ho.stdout + res_post_ho.stderr
+    assert "gate=PASSED" in res_post_ho.stdout
+
+    # CLI verify --post-run + --heldout-rate 0.20 triggers parrot-alignment warning and exits 1
+    res_post_parrot = cli.invoke(
+        app,
+        [
+            "shift",
+            "verify",
+            "--delta",
+            str(delta_path),
+            "--pre-run",
+            str(pre_dir),
+            "--post-run",
+            str(verify_dir / "post_audit"),
+            "--heldout-rate",
+            "0.20",
+            "--golden",
+            str(golden_path),
+            "--out-dir",
+            str(tmp_path / "verify_post_parrot"),
+        ],
+    )
+    assert res_post_parrot.exit_code == 1
 
     # CLI unknown backend & missing verify options exit 2
     assert (

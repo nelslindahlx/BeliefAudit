@@ -176,3 +176,32 @@ def test_cli_quick_profile_and_resume(tmp_path: Path) -> None:
     )
     assert res2.exit_code == 0
     assert "[1/" not in res2.stdout
+
+    # Resume guard rejects mismatched model_id, seed, or golden snapshot
+    from beliefaudit.security import BeliefAuditError
+
+    with pytest.raises(BeliefAuditError, match="model mismatch"):
+        run_probe_suite(
+            MockModelRunner("skewed", snapshot=BundledOfflineSeeder().seed("v0.1.0")),
+            select_profile_subset(BundledOfflineSeeder().seed("v0.1.0"), AuditProfile.QUICK)[0],
+            checkpoint_path=run_dir / "checkpoint.jsonl",
+            resume=True,
+        )
+
+    with pytest.raises(BeliefAuditError, match="seed mismatch"):
+        run_probe_suite(
+            MockModelRunner("clean", snapshot=BundledOfflineSeeder().seed("v0.1.0")),
+            select_profile_subset(BundledOfflineSeeder().seed("v0.1.0"), AuditProfile.QUICK)[0],
+            seed=99,
+            checkpoint_path=run_dir / "checkpoint.jsonl",
+            resume=True,
+        )
+
+    other_golden = BundledOfflineSeeder().seed("v0.2.0")
+    with pytest.raises(BeliefAuditError, match="golden_digest mismatch"):
+        run_probe_suite(
+            MockModelRunner("clean", snapshot=other_golden),
+            select_profile_subset(other_golden, AuditProfile.QUICK)[0],
+            checkpoint_path=run_dir / "checkpoint.jsonl",
+            resume=True,
+        )

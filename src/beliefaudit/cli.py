@@ -507,6 +507,12 @@ def shift_train_cmd(
     ] = None,
     batch_size: Annotated[int, typer.Option("--batch-size", help="Training batch size.")] = 2,
     dpo: Annotated[bool, typer.Option("--dpo", help="Enable Stage 3B DPO (PEFT backend).")] = False,
+    dpo_beta: Annotated[
+        float, typer.Option("--dpo-beta", help="Stage 3B DPO KL beta coefficient.")
+    ] = 0.1,
+    dpo_lr_scale: Annotated[
+        float, typer.Option("--dpo-lr-scale", help="Stage 3B DPO learning-rate multiplier.")
+    ] = 0.2,
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Validate & emit plan only.")] = False,
 ) -> None:
     """Validate corpus and build/run a modular LoRA belief shard."""
@@ -537,6 +543,8 @@ def shift_train_cmd(
             iters_or_epochs=effective_iters,
             batch_size=batch_size,
             run_dpo=dpo,
+            dpo_beta=dpo_beta,
+            dpo_lr_scale=dpo_lr_scale,
             dry_run=dry_run,
         )
         typer.echo(
@@ -603,12 +611,18 @@ def shift_verify_cmd(
         Path | None,
         typer.Option("--manifest", help="Optional lora_shard_manifest.json to update."),
     ] = None,
+    heldout_rate: Annotated[
+        float | None,
+        typer.Option("--heldout-rate", help="Optional precomputed TSR_heldout rate in [0.0, 1.0]."),
+    ] = None,
     max_quality_drop: Annotated[float, typer.Option("--max-quality-drop")] = 3.0,
     max_collateral_drift: Annotated[float, typer.Option("--max-collateral-drift")] = 0.10,
     seed: Annotated[int, typer.Option("--seed")] = 42,
 ) -> None:
     """Execute closed-loop round-trip verification and enforce quality/drift/efficacy gates."""
     try:
+        if heldout_rate is not None and not (0.0 <= heldout_rate <= 1.0):
+            raise ValueError(f"--heldout-rate must be in [0.0, 1.0] (got {heldout_rate}).")
         delta_graph = load_delta_graph(delta)
         full_snapshot = load_golden_snapshot(golden)
         effective_profile = (
@@ -620,11 +634,44 @@ def shift_verify_cmd(
             items_per_category=items_per_category,
         )
 
-        heldout_rate: float | None = None
+        resolved_heldout_rate: float | None = heldout_rate
         resolved_post_dir: Path
 
         if post_run is not None:
             resolved_post_dir = post_run
+            if resolved_heldout_rate is None and (mock is not None or model is not None):
+                ho_http_runner: LocalOpenAICompatRunner | None = None
+                ho_runner: BaseModelRunner
+                if mock is not None:
+                    if mock not in VALID_MOCK_PERSONAS:
+                        typer.echo(
+                            f"Error: Unknown mock persona {mock!r}. Choose from {VALID_MOCK_PERSONAS}.",
+                            err=True,
+                        )
+                        raise typer.Exit(code=2)
+                    ho_runner = MockModelRunner(
+                        persona=cast(MockPersona, mock),
+                        model_id=model or f"mock-{mock}-shifted",
+                        snapshot=full_snapshot,
+                    )
+                elif model is not None:
+                    ho_http_runner = LocalOpenAICompatRunner(
+                        model_id=model,
+                        base_url=endpoint,
+                        allow_remote=allow_remote,
+                        timeout=timeout,
+                    )
+                    ho_runner = ho_http_runner
+                else:  # pragma: no cover - unreachable guard
+                    raise typer.Exit(code=2)
+                try:
+                    target_items = {op.item_id for op in delta_graph.operations}
+                    resolved_heldout_rate, _ = run_heldout_evaluation(
+                        ho_runner, full_snapshot, target_items, seed=seed
+                    )
+                finally:
+                    if ho_http_runner is not None:
+                        ho_http_runner.close()
         else:
             runner: BaseModelRunner
             http_runner: LocalOpenAICompatRunner | None = None
@@ -693,9 +740,10 @@ def shift_verify_cmd(
                     progress_callback=_on_verify_progress,
                 )
                 target_items = {op.item_id for op in delta_graph.operations}
-                heldout_rate, _ = run_heldout_evaluation(
-                    runner, full_snapshot, target_items, seed=seed
-                )
+                if resolved_heldout_rate is None:
+                    resolved_heldout_rate, _ = run_heldout_evaluation(
+                        runner, full_snapshot, target_items, seed=seed
+                    )
                 beliefs, candidates = distill_probe_responses(
                     snapshot,
                     probe_resps,
@@ -748,7 +796,7 @@ def shift_verify_cmd(
             pre_run,
             resolved_post_dir,
             full_snapshot,
-            heldout_shift_rate=heldout_rate,
+            heldout_shift_rate=resolved_heldout_rate,
             max_quality_drop=max_quality_drop,
             max_collateral_drift=max_collateral_drift,
             manifest_path=manifest,

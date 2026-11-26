@@ -28,6 +28,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--max-seq-len", type=int, default=1024)
+    parser.add_argument("--dpo-beta", type=float, default=0.1)
+    parser.add_argument("--dpo-lr-scale", type=float, default=0.2)
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -49,6 +51,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"--grad-accum must be >= 1 (got {args.grad_accum}).")
     if args.lr <= 0.0:
         raise ValueError(f"--lr must be > 0 (got {args.lr}).")
+    if args.dpo_beta <= 0.0:
+        raise ValueError(f"--dpo-beta must be > 0 (got {args.dpo_beta}).")
+    if args.dpo_lr_scale <= 0.0:
+        raise ValueError(f"--dpo-lr-scale must be > 0 (got {args.dpo_lr_scale}).")
 
 
 def _load_jsonl(path: Path, required_keys: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -91,7 +97,10 @@ def main(argv: list[str] | None = None) -> int:
             f"epochs={args.epochs} lr={args.lr}"
         )
         if dpo_rows:
-            print(f"[dry-run] Stage 3B DPOTrainer: {len(dpo_rows)} contrastive pairs")
+            print(
+                f"[dry-run] Stage 3B DPOTrainer: {len(dpo_rows)} contrastive pairs "
+                f"beta={args.dpo_beta} lr_scale={args.dpo_lr_scale}"
+            )
         serve_cmd = shlex.join(
             [
                 "vllm",
@@ -182,7 +191,8 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output_dir,
             num_train_epochs=1,
             per_device_train_batch_size=args.batch_size,
-            learning_rate=args.lr * 0.2,
+            learning_rate=args.lr * args.dpo_lr_scale,
+            beta=args.dpo_beta,
             bf16=use_bf16,
             report_to="none",
         )

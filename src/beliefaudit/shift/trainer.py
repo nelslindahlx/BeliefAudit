@@ -28,11 +28,12 @@ class ShiftTrainerError(BeliefAuditError):
 
 
 def _resolve_training_script(script_name: str, scripts_dir: Path | None = None) -> Path:
-    """Locate standalone training script from explicit dir, source checkout, or cwd."""
+    """Locate standalone training script from explicit dir, wheel data, source checkout, or cwd."""
     candidates: list[Path] = []
     if scripts_dir is not None:
         candidates.append(scripts_dir / script_name)
     else:
+        candidates.append(Path(__file__).resolve().parent / "scripts" / script_name)
         candidates.append(Path(__file__).resolve().parents[3] / "scripts" / script_name)
         candidates.append(Path.cwd() / "scripts" / script_name)
     for cand in candidates:
@@ -42,7 +43,7 @@ def _resolve_training_script(script_name: str, scripts_dir: Path | None = None) 
     searched = ", ".join(str(c) for c in candidates)
     raise ShiftTrainerError(
         f"Training helper script {script_name!r} not found (searched: {searched}). "
-        "Run from the BeliefAudit source checkout or pass scripts_dir."
+        "Reinstall package with bundled scripts, run from source checkout, or pass scripts_dir."
     )
 
 
@@ -145,10 +146,20 @@ def build_training_command(
     iters_or_epochs: int = 200,
     batch_size: int = 2,
     run_dpo: bool = False,
+    dpo_beta: float = 0.1,
+    dpo_lr_scale: float = 0.2,
     dry_run: bool = True,
     scripts_dir: Path | None = None,
 ) -> list[str]:
     """Construct the exact Python CLI command for the selected LoRA backend."""
+    if dpo_beta <= 0.0:
+        raise ValueError(f"dpo_beta must be > 0 (got {dpo_beta}).")
+    if dpo_lr_scale <= 0.0:
+        raise ValueError(f"dpo_lr_scale must be > 0 (got {dpo_lr_scale}).")
+    if run_dpo and backend == TrainingBackend.MLX:
+        raise ShiftTrainerError(
+            "Stage 3B DPO (--dpo) is currently supported only with --backend peft, not mlx."
+        )
     adapter_dir = out_shard_dir / "adapter"
     if backend == TrainingBackend.PEFT:
         script = str(_resolve_training_script("train_peft.py", scripts_dir=scripts_dir))
@@ -173,7 +184,16 @@ def build_training_command(
             str(lora_alpha),
         ]
         if run_dpo:
-            cmd.extend(["--dpo-dataset", corpus_manifest.dpo_pairs_path])
+            cmd.extend(
+                [
+                    "--dpo-dataset",
+                    corpus_manifest.dpo_pairs_path,
+                    "--dpo-beta",
+                    str(dpo_beta),
+                    "--dpo-lr-scale",
+                    str(dpo_lr_scale),
+                ]
+            )
         if dry_run:
             cmd.append("--dry-run")
         return cmd
@@ -221,12 +241,18 @@ def run_shift_training(
     iters_or_epochs: int = 200,
     batch_size: int = 2,
     run_dpo: bool = False,
+    dpo_beta: float = 0.1,
+    dpo_lr_scale: float = 0.2,
     dry_run: bool = False,
     min_replay_ratio: float = 0.25,
     base_dir: Path | str | None = None,
     scripts_dir: Path | None = None,
 ) -> LoRAShardManifest:
     """Validate corpus, write LoRAShardManifest, and invoke backend (or dry-run)."""
+    if run_dpo and backend == TrainingBackend.MLX:
+        raise ShiftTrainerError(
+            "Stage 3B DPO (--dpo) is currently supported only with --backend peft, not mlx."
+        )
     manifest = validate_corpus_for_training(
         corpus_dir,
         min_replay_ratio=min_replay_ratio,
@@ -253,6 +279,8 @@ def run_shift_training(
         iters_or_epochs=iters_or_epochs,
         batch_size=batch_size,
         run_dpo=run_dpo,
+        dpo_beta=dpo_beta,
+        dpo_lr_scale=dpo_lr_scale,
         dry_run=effective_dry_run,
         scripts_dir=scripts_dir,
     )
