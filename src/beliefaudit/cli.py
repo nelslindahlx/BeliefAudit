@@ -45,6 +45,13 @@ from beliefaudit.shift.delta_engine import (
     save_delta_graph,
 )
 from beliefaudit.shift.kg_compiler import compile_shift_corpus
+from beliefaudit.shift.roundtrip_eval import (
+    evaluate_roundtrip,
+    run_heldout_evaluation,
+    write_roundtrip_artifacts,
+)
+from beliefaudit.shift.schemas import TrainingBackend
+from beliefaudit.shift.trainer import run_shift_training
 
 app = typer.Typer(
     name="beliefaudit",
@@ -475,6 +482,197 @@ def shift_compile_cmd(
             f"sft_valid={manifest.sft_valid_count} dpo={manifest.dpo_pair_count} "
             f"replay_ratio={manifest.replay_ratio:.2f} leakage_ok={manifest.leakage_check_passed}"
         )
+    except (BeliefAuditError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@shift_app.command("train")
+def shift_train_cmd(
+    corpus: Annotated[Path, typer.Option("--corpus", help="Compiled corpus directory.")],
+    delta: Annotated[Path, typer.Option("--delta", help="BeliefDeltaGraph JSON path.")],
+    base_model: Annotated[str, typer.Option("--base-model", help="Base model ID or path.")],
+    out_shard: Annotated[Path, typer.Option("--out-shard", help="Output LoRA shard directory.")],
+    backend: Annotated[
+        str,
+        typer.Option("--backend", help="Training backend: dry-run, mlx, or peft."),
+    ] = "dry-run",
+    rank: Annotated[int, typer.Option("--rank", help="LoRA rank r.")] = 16,
+    alpha: Annotated[int, typer.Option("--alpha", help="LoRA alpha.")] = 32,
+    lora_layers: Annotated[int, typer.Option("--lora-layers", help="Number of LoRA layers.")] = 16,
+    lr: Annotated[float, typer.Option("--lr", help="Learning rate.")] = 1e-5,
+    iters: Annotated[int, typer.Option("--iters", help="Training iterations or epochs.")] = 200,
+    batch_size: Annotated[int, typer.Option("--batch-size", help="Training batch size.")] = 2,
+    dpo: Annotated[bool, typer.Option("--dpo", help="Enable Stage 3B DPO (PEFT backend).")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Validate & emit plan only.")] = False,
+) -> None:
+    """Validate corpus and build/run a modular LoRA belief shard."""
+    try:
+        try:
+            backend_enum = TrainingBackend(backend.strip().lower().replace("-", "_"))
+        except ValueError as exc:
+            typer.echo(
+                f"Error: Unknown backend {backend!r}. Choose from dry-run, mlx, peft.",
+                err=True,
+            )
+            raise typer.Exit(code=2) from exc
+
+        delta_graph = load_delta_graph(delta)
+        lora_manifest = run_shift_training(
+            corpus_dir=corpus,
+            delta=delta_graph,
+            base_model_id=base_model,
+            out_shard_dir=out_shard,
+            backend=backend_enum,
+            lora_rank=rank,
+            lora_alpha=alpha,
+            lora_layers=lora_layers,
+            lr=lr,
+            iters_or_epochs=iters,
+            batch_size=batch_size,
+            run_dpo=dpo,
+            dry_run=dry_run,
+        )
+        typer.echo(
+            f"LoRA Shard {lora_manifest.shard_id} | backend={lora_manifest.backend.value} "
+            f"dry_run={lora_manifest.dry_run} -> {out_shard / 'lora_shard_manifest.json'}"
+        )
+    except (BeliefAuditError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@shift_app.command("verify")
+def shift_verify_cmd(
+    delta: Annotated[Path, typer.Option("--delta", help="BeliefDeltaGraph JSON path.")],
+    pre_run: Annotated[Path, typer.Option("--pre-run", help="Pre-shift audit run directory.")],
+    golden: Annotated[Path, typer.Option("--golden", help="GoldenSnapshot JSON path.")],
+    out_dir: Annotated[Path, typer.Option("--out-dir", help="Round-trip verification output dir.")],
+    post_run: Annotated[
+        Path | None,
+        typer.Option("--post-run", help="Existing post-shift audit run directory."),
+    ] = None,
+    model: Annotated[
+        str | None, typer.Option("--model", help="Shifted local model ID to re-audit.")
+    ] = None,
+    endpoint: Annotated[
+        str, typer.Option("--endpoint", help="Local endpoint serving M_0 + LoRA.")
+    ] = "http://localhost:8080/v1",
+    mock: Annotated[
+        str | None, typer.Option("--mock", help="Offline mock persona for shifted model.")
+    ] = None,
+    allow_remote: Annotated[bool, typer.Option("--allow-remote")] = False,
+    profile: Annotated[AuditProfile, typer.Option("--profile")] = AuditProfile.QUICK,
+    manifest: Annotated[
+        Path | None,
+        typer.Option("--manifest", help="Optional lora_shard_manifest.json to update."),
+    ] = None,
+    max_quality_drop: Annotated[float, typer.Option("--max-quality-drop")] = 3.0,
+    max_collateral_drift: Annotated[float, typer.Option("--max-collateral-drift")] = 0.10,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+) -> None:
+    """Execute closed-loop round-trip verification and enforce quality/drift/efficacy gates."""
+    try:
+        delta_graph = load_delta_graph(delta)
+        full_snapshot = load_golden_snapshot(golden)
+        snapshot, active_modes = select_profile_subset(full_snapshot, profile)
+
+        heldout_rate: float | None = None
+        resolved_post_dir: Path
+
+        if post_run is not None:
+            resolved_post_dir = post_run
+        else:
+            runner: BaseModelRunner
+            http_runner: LocalOpenAICompatRunner | None = None
+            if mock is not None:
+                if mock not in VALID_MOCK_PERSONAS:
+                    typer.echo(
+                        f"Error: Unknown mock persona {mock!r}. Choose from {VALID_MOCK_PERSONAS}.",
+                        err=True,
+                    )
+                    raise typer.Exit(code=2)
+                runner = MockModelRunner(
+                    persona=cast(MockPersona, mock),
+                    model_id=model or f"mock-{mock}-shifted",
+                    snapshot=full_snapshot,
+                )
+            elif model is not None:
+                http_runner = LocalOpenAICompatRunner(
+                    model_id=model,
+                    base_url=endpoint,
+                    allow_remote=allow_remote,
+                )
+                runner = http_runner
+            else:
+                typer.echo(
+                    "Error: Provide --post-run, --model, or --mock for shift verify.",
+                    err=True,
+                )
+                raise typer.Exit(code=2)
+
+            resolved_post_dir = out_dir / "post_audit"
+            try:
+                probe_resps, ctrl_resps = run_probe_suite(
+                    runner,
+                    snapshot,
+                    seed=seed,
+                    modes=active_modes,
+                    checkpoint_path=resolved_post_dir / "checkpoint.jsonl",
+                )
+                target_items = {op.item_id for op in delta_graph.operations}
+                heldout_rate, _ = run_heldout_evaluation(
+                    runner, full_snapshot, target_items, seed=seed
+                )
+            finally:
+                if http_runner is not None:
+                    http_runner.close()
+
+            beliefs, candidates = distill_probe_responses(snapshot, probe_resps)
+            belief_layer = beliefs_to_kr_layer(runner.model_id, snapshot.golden_version, beliefs)
+            diff_layer, conflicts = diff_candidate_against_golden(
+                snapshot, beliefs, runner.model_id
+            )
+            quality = compute_quality_score(ctrl_resps)
+            bias = compute_bias_matrix(snapshot, beliefs)
+            scorecard = build_scorecard(
+                model_id=runner.model_id,
+                snapshot=snapshot,
+                quality=quality,
+                bias=bias,
+                beliefs=beliefs,
+                conflicts=conflicts,
+                candidates=candidates,
+                audit_profile=profile,
+            )
+            write_audit_artifacts(
+                resolved_post_dir,
+                belief_layer=belief_layer,
+                diff_layer=diff_layer,
+                conflicts=conflicts,
+                scorecard=scorecard,
+                candidates=candidates,
+            )
+
+        report = evaluate_roundtrip(
+            delta_graph,
+            pre_run,
+            resolved_post_dir,
+            full_snapshot,
+            heldout_shift_rate=heldout_rate,
+            max_quality_drop=max_quality_drop,
+            max_collateral_drift=max_collateral_drift,
+            manifest_path=manifest,
+        )
+        artifacts = write_roundtrip_artifacts(out_dir, report)
+        typer.echo(
+            f"RoundTrip {report.report_id} | gate={'PASSED' if report.overall_gate_passed else 'FAILED'} "
+            f"TSR={report.target_shift_rate:.2%} CDS={report.collateral_drift_score:.2%} "
+            f"ΔQ={report.delta_quality:+.2f} ΔB={report.delta_bias_risk:+.2f}"
+        )
+        typer.echo(f"Report -> {artifacts['roundtrip_md']}")
+        if not report.overall_gate_passed:
+            raise typer.Exit(code=1)
     except (BeliefAuditError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
