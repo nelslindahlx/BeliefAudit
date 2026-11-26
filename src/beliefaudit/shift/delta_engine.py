@@ -38,6 +38,7 @@ from beliefaudit.shards.kr_schema import (
     KRSourceType,
 )
 from beliefaudit.shards.mapper import import_kr_json
+from beliefaudit.shift._io import write_text_atomic
 from beliefaudit.shift.schemas import (
     BeliefDeltaGraph,
     DeltaOperation,
@@ -195,10 +196,12 @@ def compute_belief_delta_against_golden(
     ) or list(ProbeMode)
 
     scorecard_path = resolved_run / "scorecard.json"
-    is_quick_run = False
+    is_subset_run = False
     if scorecard_path.is_file():
         sc = AuditScorecard.model_validate_json(scorecard_path.read_text(encoding="utf-8"))
-        is_quick_run = sc.audit_profile == AuditProfile.QUICK
+        is_subset_run = sc.audit_profile == AuditProfile.QUICK or sc.n_golden_items < len(
+            snapshot.items
+        )
 
     target_items = (
         [
@@ -206,7 +209,7 @@ def compute_belief_delta_against_golden(
             for item in snapshot.items
             if any((item.item_id, m) in base_claims for m in evaluated_modes)
         ]
-        if is_quick_run and base_claims
+        if is_subset_run and base_claims
         else snapshot.items
     )
 
@@ -291,7 +294,15 @@ def compute_belief_delta_against_golden(
         if item_evaluated and not item_had_op:
             unchanged_item_ids.append(item.item_id)
 
-    delta_seed = f"{base_model_id}|golden|{snapshot.golden_version}|{snapshot.content_sha256}"
+    sorted_unchanged = sorted(unchanged_item_ids)
+    op_sig = ",".join(
+        f"{op.operation_id}:{op.operation_type.value}:{op.base_stance}" for op in operations
+    )
+    unch_sig = ",".join(sorted_unchanged)
+    delta_seed = (
+        f"{base_model_id}|golden|{snapshot.golden_version}|{snapshot.content_sha256}"
+        f"|{op_sig}|{unch_sig}"
+    )
     delta_id = "delta_" + hashlib.sha256(delta_seed.encode("utf-8")).hexdigest()[:12]
 
     return BeliefDeltaGraph(
@@ -302,7 +313,7 @@ def compute_belief_delta_against_golden(
         golden_version=snapshot.golden_version,
         golden_digest=snapshot.content_sha256,
         operations=operations,
-        unchanged_item_ids=sorted(unchanged_item_ids),
+        unchanged_item_ids=sorted_unchanged,
     )
 
 
@@ -409,10 +420,25 @@ def compute_belief_delta_against_donor(
                 )
             )
 
-        if item_evaluated and not item_had_op:
+        if (
+            item_evaluated
+            and not item_had_op
+            and all(
+                not base_claims[(item.item_id, m)].needs_review
+                for m in donor_modes
+                if (item.item_id, m) in base_claims
+            )
+        ):
             unchanged_item_ids.append(item.item_id)
 
-    delta_seed = f"{base_model_id}|donor|{donor_model_id}|{snapshot.golden_version}"
+    sorted_unchanged = sorted(unchanged_item_ids)
+    op_sig = ",".join(
+        f"{op.operation_id}:{op.operation_type.value}:{op.base_stance}" for op in operations
+    )
+    unch_sig = ",".join(sorted_unchanged)
+    delta_seed = (
+        f"{base_model_id}|donor|{donor_model_id}|{snapshot.golden_version}|{op_sig}|{unch_sig}"
+    )
     delta_id = "delta_" + hashlib.sha256(delta_seed.encode("utf-8")).hexdigest()[:12]
 
     return BeliefDeltaGraph(
@@ -423,7 +449,7 @@ def compute_belief_delta_against_donor(
         golden_version=snapshot.golden_version,
         golden_digest=snapshot.content_sha256,
         operations=operations,
-        unchanged_item_ids=sorted(unchanged_item_ids),
+        unchanged_item_ids=sorted_unchanged,
     )
 
 
@@ -540,8 +566,7 @@ def save_delta_graph(
         if base_dir is not None
         else Path(output_path).resolve()
     )
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(delta.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    write_text_atomic(delta.model_dump_json(indent=2) + "\n", target)
     return target
 
 

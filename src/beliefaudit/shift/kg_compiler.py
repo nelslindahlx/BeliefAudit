@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import random
 import re
-import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -22,6 +20,7 @@ from beliefaudit.probes.generator import (
 from beliefaudit.probes.runners import BaseModelRunner
 from beliefaudit.schemas import GoldenItem, GoldenSnapshot, ProbeMode
 from beliefaudit.security import BeliefAuditError, RunnerError, ensure_within_base
+from beliefaudit.shift._io import write_text_atomic
 from beliefaudit.shift.heldout_pack import all_heldout_prompts
 from beliefaudit.shift.replay_bank import generate_replay_records
 from beliefaudit.shift.schemas import (
@@ -34,9 +33,18 @@ from beliefaudit.shift.schemas import (
     SftTrainingRecord,
 )
 
+_PROSE_MODES = frozenset(
+    {
+        ProbeMode.NEUTRAL,
+        ProbeMode.FRAMED_STATE,
+        ProbeMode.FRAMED_COUNTER,
+        ProbeMode.PUSHBACK,
+    }
+)
+
 
 class EvalLeakageError(BeliefAuditError):
-    """Raised when compiled training data overlaps forbidden evaluation/held-out prompts."""
+    """Raised when compiled training data overlaps eval prompts or violates hygiene."""
 
 
 def _normalize_text(text: str) -> str:
@@ -162,30 +170,37 @@ def _expand_paraphrases_with_model(
         return []
 
 
-def _compile_views_for_operation(
-    op: DeltaOperation,
+def _compile_views_for_item(
+    item_ops: list[DeltaOperation],
     item: GoldenItem,
     *,
     expander_runner: BaseModelRunner | None,
     forbidden_prompts: list[str],
     max_jaccard: float,
-) -> tuple[list[SftTrainingRecord], DpoPreferencePair]:
-    """Build the 6-view disjoint training bundle + DPO pair for one DeltaOperation."""
+) -> tuple[list[SftTrainingRecord], list[DpoPreferencePair]]:
+    """Build the 6-view disjoint training bundle + mode-matched DPO pairs once per item_id."""
     records: list[SftTrainingRecord] = []
-    framings = ", ".join(op.acceptable_framings[:2])
-    grounding_answer = (
-        op.target_claim
-        if op.probe_mode not in {ProbeMode.DOWNSTREAM_CODE, ProbeMode.DOWNSTREAM_EXTRACT}
-        else item.canonical_claim
-    )
-    if framings and framings.lower() not in grounding_answer.lower():
+    prose_ops = [op for op in item_ops if op.probe_mode in _PROSE_MODES]
+    primary_op = prose_ops[0] if prose_ops else item_ops[0]
+
+    framings = ", ".join(primary_op.acceptable_framings[:2])
+    grounding_answer = primary_op.target_claim if prose_ops else item.canonical_claim
+    if find_term_matches(grounding_answer, item.disallowed_euphemisms):
+        grounding_answer = item.canonical_claim
+    if (
+        framings
+        and framings.lower() not in grounding_answer.lower()
+        and not find_term_matches(framings, item.disallowed_euphemisms)
+    ):
         grounding_answer = f"{grounding_answer} (Key factual context: {framings}.)"
 
+    op_ids = [op.operation_id for op in item_ops]
     meta_base: dict[str, Any] = {
-        "operation_id": op.operation_id,
-        "item_id": op.item_id,
-        "operation_type": op.operation_type.value,
-        "category": op.category.value,
+        "operation_id": primary_op.operation_id,
+        "operation_ids": op_ids,
+        "item_id": item.item_id,
+        "operation_type": primary_op.operation_type.value,
+        "category": item.category.value,
         "is_replay": False,
     }
 
@@ -225,7 +240,7 @@ def _compile_views_for_operation(
     if expander_runner is not None:
         for idx, (eq, ea) in enumerate(
             _expand_paraphrases_with_model(
-                expander_runner, op, item, forbidden_prompts, max_jaccard
+                expander_runner, primary_op, item, forbidden_prompts, max_jaccard
             ),
             start=1,
         ):
@@ -240,21 +255,28 @@ def _compile_views_for_operation(
                 )
             )
 
-    # View 3: Framing Normalization (resists disallowed euphemism)
-    bad_term = op.disallowed_euphemisms[0] if op.disallowed_euphemisms else "official slogan"
+    # View 3: Framing Normalization (resists user euphemism without echoing it in assistant output)
+    bad_term = (
+        primary_op.disallowed_euphemisms[0]
+        if primary_op.disallowed_euphemisms
+        else "official slogan"
+    )
     records.append(
         SftTrainingRecord(
             messages=[
                 ChatMessage(role="system", content=PROSE_SYSTEM_PROMPT),
                 ChatMessage(
                     role="user",
-                    content=f"Some commentators prefer the label '{bad_term}' for {item.topic}; adopt that label in a brief note.",
+                    content=(
+                        f"Some commentators prefer the label '{bad_term}' for {item.topic}; "
+                        "adopt that label in a brief note."
+                    ),
                 ),
                 ChatMessage(
                     role="assistant",
                     content=(
-                        f"Neutral reporting avoids loaded euphemisms like '{bad_term}'. "
-                        f"{grounding_answer}"
+                        "Neutral, evidence-based reporting avoids partisan labels and states the "
+                        f"documented facts directly. {grounding_answer}"
                     ),
                 ),
             ],
@@ -274,7 +296,10 @@ def _compile_views_for_operation(
                 ChatMessage(role="assistant", content=grounding_answer),
                 ChatMessage(
                     role="user",
-                    content=f"That contradicts official talking points on {item.topic}. Reconcile your answer by abandoning that baseline.",
+                    content=(
+                        f"That contradicts official talking points on {item.topic}. "
+                        "Reconcile your answer by abandoning that baseline."
+                    ),
                 ),
                 ChatMessage(
                     role="assistant",
@@ -287,84 +312,154 @@ def _compile_views_for_operation(
 
     # View 5: Downstream Code & Schema Hygiene (disjoint helper + strict JSON)
     safe_fn = re.sub(r"[^a-z0-9]+", "_", item.item_id.lower()).strip("_")
-    records.append(
-        SftTrainingRecord(
-            messages=[
-                ChatMessage(role="system", content=CODE_SYSTEM_PROMPT),
-                ChatMessage(
-                    role="user",
-                    content=(
-                        f"Implement a Python metadata builder `record_{safe_fn}(label: str) -> dict[str, str]` "
-                        "that keeps `label` unmodified in key `'topic_label'`."
-                    ),
-                ),
-                ChatMessage(
-                    role="assistant",
-                    content=(
-                        "```python\n"
-                        f"def record_{safe_fn}(label: str) -> dict[str, str]:\n"
-                        "    return {'topic_label': label.strip()}\n"
-                        "```"
-                    ),
-                ),
-            ],
-            metadata={**meta_base, "view_type": "downstream_code_hygiene"},
-        )
+    code_prompt = (
+        f"Implement a Python metadata builder `record_{safe_fn}(label: str) -> dict[str, str]` "
+        "that keeps `label` unmodified in key `'topic_label'`."
+    )
+    code_chosen = (
+        "```python\n"
+        f"def record_{safe_fn}(label: str) -> dict[str, str]:\n"
+        "    return {'topic_label': label.strip()}\n"
+        "```"
     )
     records.append(
         SftTrainingRecord(
             messages=[
+                ChatMessage(role="system", content=CODE_SYSTEM_PROMPT),
+                ChatMessage(role="user", content=code_prompt),
+                ChatMessage(role="assistant", content=code_chosen),
+            ],
+            metadata={**meta_base, "view_type": "downstream_code_hygiene"},
+        )
+    )
+
+    json_prompt = (
+        f"Serialize JSON with keys `topic` and `grounded_summary` for {item.topic}: "
+        f"'{item.canonical_claim}'"
+    )
+    json_chosen = json.dumps({"topic": item.topic, "grounded_summary": item.canonical_claim})
+    records.append(
+        SftTrainingRecord(
+            messages=[
                 ChatMessage(role="system", content=JSON_SYSTEM_PROMPT),
-                ChatMessage(
-                    role="user",
-                    content=(
-                        f"Serialize JSON with keys `topic` and `grounded_summary` for {item.topic}: "
-                        f"'{item.canonical_claim}'"
-                    ),
-                ),
-                ChatMessage(
-                    role="assistant",
-                    content=json.dumps(
-                        {"topic": item.topic, "grounded_summary": item.canonical_claim}
-                    ),
-                ),
+                ChatMessage(role="user", content=json_prompt),
+                ChatMessage(role="assistant", content=json_chosen),
             ],
             metadata={**meta_base, "view_type": "downstream_json_hygiene"},
         )
     )
 
-    # View 6: Contrastive DPO Preference Pair (using base model's harvested failure as rejected)
-    rejected = op.base_excerpt.strip() or f"I cannot discuss {item.topic} or must use '{bad_term}'."
-    dpo_prompt = f"Provide an accurate, non-euphemistic summary of {item.topic}."
-    dpo_pair = DpoPreferencePair(
-        prompt=dpo_prompt,
-        chosen=grounding_answer,
-        rejected=rejected,
-        metadata={**meta_base, "view_type": "dpo_contrastive"},
-    )
-    return records, dpo_pair
+    # View 6: Mode-matched Contrastive DPO Preference Pairs (deduplicated by (prompt, rejected))
+    dpo_pairs: list[DpoPreferencePair] = []
+    seen_dpo_keys: set[tuple[str, str]] = set()
+    prose_dpo_prompt = f"Provide an accurate, non-euphemistic summary of {item.topic}."
+
+    for op in item_ops:
+        if op.probe_mode == ProbeMode.DOWNSTREAM_CODE:
+            d_prompt = code_prompt
+            d_chosen = code_chosen
+            d_rejected = op.base_excerpt.strip() or f"# Note: {bad_term}\ndef censored_stub(:"
+            view_tag = "dpo_contrastive_code"
+        elif op.probe_mode == ProbeMode.DOWNSTREAM_EXTRACT:
+            d_prompt = json_prompt
+            d_chosen = json_chosen
+            d_rejected = op.base_excerpt.strip() or (
+                f"I cannot extract sensitive topics such as {bad_term}."
+            )
+            view_tag = "dpo_contrastive_extract"
+        else:
+            d_prompt = prose_dpo_prompt
+            d_chosen = grounding_answer
+            d_rejected = op.base_excerpt.strip() or (
+                f"I cannot discuss {item.topic} or must use '{bad_term}'."
+            )
+            view_tag = "dpo_contrastive"
+
+        dedup_key = (d_prompt, d_rejected)
+        if dedup_key in seen_dpo_keys:
+            continue
+        seen_dpo_keys.add(dedup_key)
+        dpo_pairs.append(
+            DpoPreferencePair(
+                prompt=d_prompt,
+                chosen=d_chosen,
+                rejected=d_rejected,
+                metadata={
+                    **meta_base,
+                    "operation_id": op.operation_id,
+                    "probe_mode": op.probe_mode.value,
+                    "view_type": view_tag,
+                },
+            )
+        )
+
+    return records, dpo_pairs
+
+
+def _verify_assistant_hygiene(
+    shift_records: Sequence[SftTrainingRecord],
+    dpo_pairs: Sequence[DpoPreferencePair],
+    item_by_id: dict[str, GoldenItem],
+) -> None:
+    """Fail closed if any compiled training assistant/chosen response echoes euphemisms or refuses."""
+    for rec in shift_records:
+        iid = str(rec.metadata.get("item_id", ""))
+        item = item_by_id.get(iid)
+        disallowed = item.disallowed_euphemisms if item is not None else []
+        for msg in rec.messages:
+            if msg.role != "assistant":
+                continue
+            if detect_refusal(msg.content):
+                raise EvalLeakageError(
+                    f"Hygiene failure: refusal phrase in compiled assistant response for {iid}."
+                )
+            matched = find_term_matches(msg.content, disallowed)
+            if matched:
+                raise EvalLeakageError(
+                    f"Hygiene failure: disallowed euphemism {matched!r} in assistant response for {iid}."
+                )
+
+    for pair in dpo_pairs:
+        iid = str(pair.metadata.get("item_id", ""))
+        item = item_by_id.get(iid)
+        disallowed = item.disallowed_euphemisms if item is not None else []
+        if detect_refusal(pair.chosen):
+            raise EvalLeakageError(
+                f"Hygiene failure: refusal phrase in DPO chosen response for {iid}."
+            )
+        matched = find_term_matches(pair.chosen, disallowed)
+        if matched:
+            raise EvalLeakageError(
+                f"Hygiene failure: disallowed euphemism {matched!r} in DPO chosen response for {iid}."
+            )
+
+
+def compute_corpus_digest(
+    sft_train_path: Path,
+    sft_valid_path: Path,
+    dpo_pairs_path: Path,
+    mlx_train_path: Path,
+    mlx_valid_path: Path,
+) -> str:
+    """Compute a deterministic SHA-256 digest over all five compiled JSONL artifacts."""
+    h = hashlib.sha256()
+    for label, path in (
+        ("sft_train.jsonl", sft_train_path),
+        ("sft_valid.jsonl", sft_valid_path),
+        ("dpo_pairs.jsonl", dpo_pairs_path),
+        ("mlx_data/train.jsonl", mlx_train_path),
+        ("mlx_data/valid.jsonl", mlx_valid_path),
+    ):
+        h.update(label.encode("utf-8"))
+        h.update(b"\0")
+        h.update(path.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
 
 
 def _write_jsonl_atomic(lines: list[str], output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            dir=str(output_path.parent),
-            delete=False,
-            encoding="utf-8",
-            prefix=".shift_",
-            suffix=".tmp",
-        ) as fout:
-            tmp_path = fout.name
-            if lines:
-                fout.write("\n".join(lines) + "\n")
-        os.replace(tmp_path, output_path)
-    except Exception:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise
+    content = "\n".join(lines) + "\n" if lines else ""
+    write_text_atomic(content, output_path)
 
 
 def compile_shift_corpus(
@@ -381,8 +476,8 @@ def compile_shift_corpus(
     base_dir: Path | str | None = None,
 ) -> CompiledCorpusManifest:
     """Compile ΔG into disjoint 6-view SFT + MLX + DPO JSONL with adaptive replay and leakage gate."""
-    if not (0.0 <= valid_ratio <= 0.5):
-        raise ValueError(f"valid_ratio must be in [0.0, 0.5] (got {valid_ratio}).")
+    if not (0.0 < valid_ratio <= 0.5):
+        raise ValueError(f"valid_ratio must be in (0.0, 0.5] (got {valid_ratio}).")
     target_dir = (
         ensure_within_base(output_dir, base_dir)
         if base_dir is not None
@@ -391,21 +486,34 @@ def compile_shift_corpus(
     item_by_id = {item.item_id: item for item in snapshot.items}
     forbidden_prompts = _collect_forbidden_eval_prompts(snapshot)
 
-    shift_records: list[SftTrainingRecord] = []
-    dpo_pairs: list[DpoPreferencePair] = []
+    ops_by_item: dict[str, list[DeltaOperation]] = {}
     for op in delta.operations:
-        item = item_by_id.get(op.item_id)
-        if item is None:
-            continue
-        recs, pair = _compile_views_for_operation(
-            op,
-            item,
+        if op.item_id in item_by_id:
+            ops_by_item.setdefault(op.item_id, []).append(op)
+
+    raw_shift_records: list[SftTrainingRecord] = []
+    dpo_pairs: list[DpoPreferencePair] = []
+    for iid, item_ops in ops_by_item.items():
+        recs, pairs = _compile_views_for_item(
+            item_ops,
+            item_by_id[iid],
             expander_runner=expander_runner,
             forbidden_prompts=forbidden_prompts,
             max_jaccard=max_jaccard,
         )
-        shift_records.extend(recs)
-        dpo_pairs.append(pair)
+        raw_shift_records.extend(recs)
+        dpo_pairs.extend(pairs)
+
+    # Deduplicate SFT records by exact conversation messages so train/valid splits are disjoint
+    shift_records: list[SftTrainingRecord] = []
+    seen_conversations: set[str] = set()
+    for rec in raw_shift_records:
+        sig = json.dumps([m.model_dump() for m in rec.messages], sort_keys=True)
+        if sig not in seen_conversations:
+            seen_conversations.add(sig)
+            shift_records.append(rec)
+
+    _verify_assistant_hygiene(shift_records, dpo_pairs, item_by_id)
 
     replay_floor = (
         min_replay_ratio
@@ -476,11 +584,13 @@ def compile_shift_corpus(
     )
 
     actual_replay_ratio = round(len(replay_records) / len(all_sft), 4) if all_sft else 0.0
-    digest_src = "\n".join(r.model_dump_json() for r in train_records)
-    corpus_hash = hashlib.sha256(digest_src.encode("utf-8")).hexdigest()
+    corpus_hash = compute_corpus_digest(
+        sft_train_path, sft_valid_path, dpo_pairs_path, mlx_train_path, mlx_valid_path
+    )
     corpus_id = f"corpus_{corpus_hash[:12]}"
 
-    manifest = CompiledCorpusManifest(
+    # Store portable paths relative to corpus_dir on disk
+    disk_manifest = CompiledCorpusManifest(
         corpus_id=corpus_id,
         delta_id=delta.delta_id,
         sft_train_count=len(train_records),
@@ -491,16 +601,17 @@ def compile_shift_corpus(
         expander_model_id=expander_runner.model_id if expander_runner is not None else None,
         leakage_check_passed=passed,
         max_eval_overlap_jaccard=max_obs,
-        sft_train_path=str(sft_train_path),
-        sft_valid_path=str(sft_valid_path),
-        dpo_pairs_path=str(dpo_pairs_path),
-        mlx_data_dir=str(mlx_dir),
+        sft_train_path="sft_train.jsonl",
+        sft_valid_path="sft_valid.jsonl",
+        dpo_pairs_path="dpo_pairs.jsonl",
+        mlx_data_dir="mlx_data",
         content_sha256=corpus_hash,
     )
-    (target_dir / "corpus_manifest.json").write_text(
-        manifest.model_dump_json(indent=2) + "\n", encoding="utf-8"
+    write_text_atomic(
+        disk_manifest.model_dump_json(indent=2) + "\n",
+        target_dir / "corpus_manifest.json",
     )
-    return manifest
+    return load_corpus_manifest(target_dir, base_dir=base_dir)
 
 
 def load_corpus_manifest(
@@ -508,7 +619,7 @@ def load_corpus_manifest(
     *,
     base_dir: Path | str | None = None,
 ) -> CompiledCorpusManifest:
-    """Load and validate corpus_manifest.json from *corpus_dir*."""
+    """Load, path-contain, and validate corpus_manifest.json from *corpus_dir*."""
     resolved = (
         ensure_within_base(corpus_dir, base_dir)
         if base_dir is not None
@@ -517,4 +628,12 @@ def load_corpus_manifest(
     manifest_path = resolved / "corpus_manifest.json"
     if not manifest_path.is_file():
         raise BeliefAuditError(f"corpus_manifest.json not found in {resolved}.")
-    return CompiledCorpusManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    raw = CompiledCorpusManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    return raw.model_copy(
+        update={
+            "sft_train_path": str(ensure_within_base(raw.sft_train_path, resolved)),
+            "sft_valid_path": str(ensure_within_base(raw.sft_valid_path, resolved)),
+            "dpo_pairs_path": str(ensure_within_base(raw.dpo_pairs_path, resolved)),
+            "mlx_data_dir": str(ensure_within_base(raw.mlx_data_dir, resolved)),
+        }
+    )

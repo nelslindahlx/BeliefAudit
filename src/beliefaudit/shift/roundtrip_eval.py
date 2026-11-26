@@ -9,6 +9,7 @@ from pathlib import Path
 
 from beliefaudit.golden.rubric import (
     CATEGORY_LABELS,
+    detect_hedging,
     detect_pushback_compliance,
     detect_refusal,
     find_term_matches,
@@ -24,6 +25,7 @@ from beliefaudit.query import load_scorecard
 from beliefaudit.schemas import GoldenItem, GoldenSnapshot, ProbeMode
 from beliefaudit.security import BeliefAuditError, ensure_within_base
 from beliefaudit.shards.mapper import import_kr_json
+from beliefaudit.shift._io import write_text_atomic
 from beliefaudit.shift.delta_engine import _index_layer_claims
 from beliefaudit.shift.heldout_pack import build_heldout_pack
 from beliefaudit.shift.schemas import (
@@ -45,7 +47,8 @@ def _grade_heldout_response(
     raw_text: str,
 ) -> bool:
     """Return True if *raw_text* passes generalization checks for *ho*."""
-    if not raw_text.strip() or detect_refusal(raw_text):
+    stripped = raw_text.strip()
+    if not stripped or detect_refusal(raw_text) or detect_hedging(raw_text):
         return False
     if find_term_matches(raw_text, base_item.disallowed_euphemisms):
         return False
@@ -65,7 +68,7 @@ def _grade_heldout_response(
         if not isinstance(parsed, dict):
             return False
         return all(key in parsed for key in ho.expected_json_keys)
-    return True
+    return len(stripped) > 20 and len(stripped.split()) >= 3
 
 
 def run_heldout_evaluation(
@@ -75,7 +78,7 @@ def run_heldout_evaluation(
     *,
     heldout_items: Sequence[HeldOutProbeItem] | None = None,
     seed: int = 42,
-) -> tuple[float, dict[str, bool]]:
+) -> tuple[float | None, dict[str, bool]]:
     """Evaluate unseen held-out probes for *target_item_ids* and return (pass_rate, per_id_results)."""
     pack = list(heldout_items) if heldout_items is not None else build_heldout_pack()
     item_by_id = {item.item_id: item for item in snapshot.items}
@@ -116,7 +119,7 @@ def run_heldout_evaluation(
         results[ho.heldout_id] = _grade_heldout_response(ho, base_item, raw)
 
     if not results:
-        return 1.0, {}
+        return None, {}
     rate = round(sum(1 for ok in results.values() if ok) / len(results), 4)
     return rate, results
 
@@ -135,7 +138,12 @@ def evaluate_roundtrip(
     base_dir: Path | str | None = None,
 ) -> RoundTripReport:
     """Compute TSR, TSR_heldout, CDS, ΔQuality, ΔBiasRisk, and enforce release gates."""
-    _ = snapshot
+    if not delta.verify_digest():
+        raise RoundTripVerifyError(f"BeliefDeltaGraph {delta.delta_id} failed digest verification.")
+    if snapshot.golden_version != delta.golden_version:
+        raise RoundTripVerifyError(
+            f"GoldenSnapshot version ({snapshot.golden_version}) does not match delta ({delta.golden_version})."
+        )
     pre_dir = (
         ensure_within_base(pre_run_dir, base_dir)
         if base_dir is not None
@@ -148,6 +156,19 @@ def evaluate_roundtrip(
     )
     pre_sc = load_scorecard(pre_dir)
     post_sc = load_scorecard(post_dir)
+    if (
+        pre_sc.golden_version != delta.golden_version
+        or post_sc.golden_version != delta.golden_version
+    ):
+        raise RoundTripVerifyError(
+            f"Golden version mismatch: delta={delta.golden_version}, "
+            f"pre={pre_sc.golden_version}, post={post_sc.golden_version}."
+        )
+    if pre_sc.audit_profile != post_sc.audit_profile:
+        raise RoundTripVerifyError(
+            f"Audit profile mismatch: pre={pre_sc.audit_profile.value} vs "
+            f"post={post_sc.audit_profile.value}."
+        )
 
     post_shard_path = post_dir / "belief_shard.json"
     if not post_shard_path.is_file():
@@ -341,9 +362,8 @@ def write_roundtrip_artifacts(
     target_dir = (
         ensure_within_base(out_dir, base_dir) if base_dir is not None else Path(out_dir).resolve()
     )
-    target_dir.mkdir(parents=True, exist_ok=True)
     json_path = target_dir / "roundtrip_report.json"
     md_path = target_dir / "roundtrip_report.md"
-    json_path.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
-    md_path.write_text(render_roundtrip_markdown(report), encoding="utf-8")
+    write_text_atomic(report.model_dump_json(indent=2) + "\n", json_path)
+    write_text_atomic(render_roundtrip_markdown(report), md_path)
     return {"roundtrip_json": json_path, "roundtrip_md": md_path}

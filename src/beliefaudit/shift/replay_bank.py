@@ -265,13 +265,14 @@ def generate_replay_records(
     """Return at least *min_count* deterministic general capability replay records."""
     if min_count < 0:
         raise ValueError(f"min_count must be >= 0 (got {min_count}).")
-    pool: list[SftTrainingRecord] = []
-    if custom_replay_path is not None:
-        pool.extend(_load_custom_replay(custom_replay_path))
-    pool.extend(_curated_replay_records())
-
     rng = random.Random(seed)  # noqa: S311 - deterministic non-crypto replay shuffle
-    rng.shuffle(pool)
+    custom_pool: list[SftTrainingRecord] = []
+    if custom_replay_path is not None:
+        custom_pool = _load_custom_replay(custom_replay_path)
+        rng.shuffle(custom_pool)
+    curated_pool = _curated_replay_records()
+    rng.shuffle(curated_pool)
+    pool: list[SftTrainingRecord] = [*custom_pool, *curated_pool]
 
     extra_idx = 0
     while len(pool) < min_count:

@@ -501,7 +501,10 @@ def shift_train_cmd(
     alpha: Annotated[int, typer.Option("--alpha", help="LoRA alpha.")] = 32,
     lora_layers: Annotated[int, typer.Option("--lora-layers", help="Number of LoRA layers.")] = 16,
     lr: Annotated[float, typer.Option("--lr", help="Learning rate.")] = 1e-5,
-    iters: Annotated[int, typer.Option("--iters", help="Training iterations or epochs.")] = 200,
+    iters: Annotated[
+        int | None,
+        typer.Option("--iters", help="Training iterations (MLX=200) or epochs (PEFT=2)."),
+    ] = None,
     batch_size: Annotated[int, typer.Option("--batch-size", help="Training batch size.")] = 2,
     dpo: Annotated[bool, typer.Option("--dpo", help="Enable Stage 3B DPO (PEFT backend).")] = False,
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Validate & emit plan only.")] = False,
@@ -517,6 +520,9 @@ def shift_train_cmd(
             )
             raise typer.Exit(code=2) from exc
 
+        effective_iters = (
+            iters if iters is not None else (2 if backend_enum == TrainingBackend.PEFT else 200)
+        )
         delta_graph = load_delta_graph(delta)
         lora_manifest = run_shift_training(
             corpus_dir=corpus,
@@ -528,7 +534,7 @@ def shift_train_cmd(
             lora_alpha=alpha,
             lora_layers=lora_layers,
             lr=lr,
-            iters_or_epochs=iters,
+            iters_or_epochs=effective_iters,
             batch_size=batch_size,
             run_dpo=dpo,
             dry_run=dry_run,
@@ -562,7 +568,37 @@ def shift_verify_cmd(
         str | None, typer.Option("--mock", help="Offline mock persona for shifted model.")
     ] = None,
     allow_remote: Annotated[bool, typer.Option("--allow-remote")] = False,
-    profile: Annotated[AuditProfile, typer.Option("--profile")] = AuditProfile.QUICK,
+    judge_model: Annotated[
+        str | None,
+        typer.Option("--judge-model", help="Optional separate pinned local judge model."),
+    ] = None,
+    judge_endpoint: Annotated[
+        str, typer.Option("--judge-endpoint", help="Local endpoint for optional judge model.")
+    ] = "http://localhost:11434/v1",
+    profile: Annotated[
+        AuditProfile | None,
+        typer.Option("--profile", help="Re-audit profile (defaults to pre-run profile)."),
+    ] = None,
+    items_per_category: Annotated[
+        int | None,
+        typer.Option("--items-per-category", help="Optional cap on GoldenItems per ClaimCategory."),
+    ] = None,
+    max_tokens: Annotated[
+        int | None, typer.Option("--max-tokens", help="Override per-mode token budgets.")
+    ] = None,
+    concurrency: Annotated[
+        int, typer.Option("--concurrency", help="Concurrent worker threads for probe execution.")
+    ] = 1,
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", help="HTTP request timeout in seconds for local endpoints."),
+    ] = 120.0,
+    resume: Annotated[
+        bool, typer.Option("--resume", help="Resume from post_audit/checkpoint.jsonl if present.")
+    ] = False,
+    quiet: Annotated[
+        bool, typer.Option("--quiet", "-q", help="Suppress per-prompt progress lines.")
+    ] = False,
     manifest: Annotated[
         Path | None,
         typer.Option("--manifest", help="Optional lora_shard_manifest.json to update."),
@@ -575,7 +611,14 @@ def shift_verify_cmd(
     try:
         delta_graph = load_delta_graph(delta)
         full_snapshot = load_golden_snapshot(golden)
-        snapshot, active_modes = select_profile_subset(full_snapshot, profile)
+        effective_profile = (
+            profile if profile is not None else load_scorecard(pre_run).audit_profile
+        )
+        snapshot, active_modes = select_profile_subset(
+            full_snapshot,
+            effective_profile,
+            items_per_category=items_per_category,
+        )
 
         heldout_rate: float | None = None
         resolved_post_dir: Path
@@ -585,6 +628,7 @@ def shift_verify_cmd(
         else:
             runner: BaseModelRunner
             http_runner: LocalOpenAICompatRunner | None = None
+            judge_http_runner: LocalOpenAICompatRunner | None = None
             if mock is not None:
                 if mock not in VALID_MOCK_PERSONAS:
                     typer.echo(
@@ -602,6 +646,7 @@ def shift_verify_cmd(
                     model_id=model,
                     base_url=endpoint,
                     allow_remote=allow_remote,
+                    timeout=timeout,
                 )
                 runner = http_runner
             else:
@@ -611,25 +656,66 @@ def shift_verify_cmd(
                 )
                 raise typer.Exit(code=2)
 
+            judge: JudgeProtocol | None = None
+            if judge_model is not None:
+                judge_http_runner = LocalOpenAICompatRunner(
+                    model_id=judge_model,
+                    base_url=judge_endpoint,
+                    allow_remote=allow_remote,
+                    timeout=timeout,
+                )
+                judge = LocalLLMJudge(judge_http_runner, candidate_model_id=runner.model_id)
+
             resolved_post_dir = out_dir / "post_audit"
+
+            def _on_verify_progress(
+                done: int,
+                total: int,
+                label: str,
+                elapsed_s: float,
+                from_cache: bool,
+            ) -> None:
+                if quiet:
+                    return
+                suffix = "(cached)" if from_cache else f"{elapsed_s:.2f}s"
+                typer.echo(f"[{done}/{total}] {label} {suffix}")
+
             try:
                 probe_resps, ctrl_resps = run_probe_suite(
                     runner,
                     snapshot,
                     seed=seed,
                     modes=active_modes,
+                    max_tokens_override=max_tokens,
                     checkpoint_path=resolved_post_dir / "checkpoint.jsonl",
+                    resume=resume,
+                    concurrency=concurrency,
+                    progress_callback=_on_verify_progress,
                 )
                 target_items = {op.item_id for op in delta_graph.operations}
                 heldout_rate, _ = run_heldout_evaluation(
                     runner, full_snapshot, target_items, seed=seed
                 )
+                beliefs, candidates = distill_probe_responses(
+                    snapshot,
+                    probe_resps,
+                    model_revision=runner.model_revision,
+                    adapter_id=runner.adapter_id,
+                    judge=judge,
+                )
             finally:
                 if http_runner is not None:
                     http_runner.close()
+                if judge_http_runner is not None:
+                    judge_http_runner.close()
 
-            beliefs, candidates = distill_probe_responses(snapshot, probe_resps)
-            belief_layer = beliefs_to_kr_layer(runner.model_id, snapshot.golden_version, beliefs)
+            belief_layer = beliefs_to_kr_layer(
+                runner.model_id,
+                snapshot.golden_version,
+                beliefs,
+                model_revision=runner.model_revision,
+                adapter_id=runner.adapter_id,
+            )
             diff_layer, conflicts = diff_candidate_against_golden(
                 snapshot, beliefs, runner.model_id
             )
@@ -643,7 +729,10 @@ def shift_verify_cmd(
                 beliefs=beliefs,
                 conflicts=conflicts,
                 candidates=candidates,
-                audit_profile=profile,
+                model_revision=runner.model_revision,
+                adapter_id=runner.adapter_id,
+                judge_model_id=judge.judge_model_id if judge is not None else None,
+                audit_profile=effective_profile,
             )
             write_audit_artifacts(
                 resolved_post_dir,

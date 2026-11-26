@@ -2,6 +2,13 @@
 
 All notable changes to **BeliefAudit** are documented in this file.
 
+## [0.2.1] - 2026-11-26
+
+### Fixed & Hardened
+- **Compiler hygiene & deduplication (`kg_compiler.py`)**: Removed disallowed euphemisms from View 3 assistant training targets, grouped SFT views by `item_id` + deduplicated before train/valid splitting (eliminating 2x–6x multi-mode row duplication), matched View 6 DPO prompts/chosen outputs to `DOWNSTREAM_CODE`/`DOWNSTREAM_EXTRACT` modes, added assistant hygiene checks (`detect_refusal` / `find_term_matches`), tightened `valid_ratio > 0.0`, and switched disk `corpus_manifest.json` paths to portable relative paths validated via `ensure_within_base` + full 5-file SHA-256 (`compute_corpus_digest`).
+- **MLX/PEFT scripts & orchestrator (`trainer.py`, `scripts/train_mlx.py`, `scripts/train_peft.py`)**: Wired `--lora-alpha` and YAML `lora_parameters` (`rank`, `scale`) in `train_mlx.py`, updated `train_peft.py` to modern `trl` (`SFTConfig` + `processing_class`), removed silent `--epochs` clamping in `build_training_command`, sanitized `source_belief_shard_id`, verified `content_sha256` on load, and used `shlex.join` + atomic writes via `_io.py`.
+- **Delta & verification gates (`delta_engine.py`, `roundtrip_eval.py`, `runners.py`, `cli.py`)**: Handled `--profile full --items-per-category N` subset runs cleanly, prevented blocked/broken donor items from polluting `unchanged_item_ids`, included `operations_summary` and operation signatures in digests/IDs, rejected evasive/short answers in held-out grading (`None` instead of `1.0` on unmatched sets), enforced pre/post `audit_profile` and `golden_version` parity, registered held-out prior prompts in `MockModelRunner`, and auto-inferred `--profile` + added full runner/judge options to `beliefaudit shift verify`.
+
 ## [0.2.0] - 2026-11-26
 
 ### Added

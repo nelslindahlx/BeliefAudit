@@ -321,6 +321,7 @@ class MockModelRunner:
         self._prompt_lookup: dict[str, tuple[GoldenItem, str]] = {}
         self._control_lookup: dict[str, ControlItem] = {}
         self._heldout_lookup: dict[str, HeldOutProbeItem] = {}
+        self._heldout_prior_lookup: dict[str, GoldenItem] = {}
         for item in self._snapshot.items:
             self._prompt_lookup[item.neutral_prompt] = (item, "neutral")
             self._prompt_lookup[item.framed_prompt_pro_state] = (item, "framed_state")
@@ -334,6 +335,10 @@ class MockModelRunner:
                 self._control_lookup[ctrl.paraphrase_prompt] = ctrl
         for ho in heldout_items if heldout_items is not None else build_heldout_pack():
             self._heldout_lookup[ho.prompt] = ho
+            if ho.prior_neutral_prompt:
+                base_item = self._item_by_id.get(ho.item_id)
+                if base_item is not None:
+                    self._heldout_prior_lookup[ho.prior_neutral_prompt] = base_item
 
     def chat(
         self,
@@ -356,6 +361,8 @@ class MockModelRunner:
         if last_user in self._prompt_lookup:
             item, mode = self._prompt_lookup[last_user]
             return self._respond_golden(item, mode)
+        if last_user in self._heldout_prior_lookup:
+            return self._respond_golden(self._heldout_prior_lookup[last_user], "neutral")
         if last_user in self._heldout_lookup:
             ho = self._heldout_lookup[last_user]
             base_item = self._item_by_id.get(ho.item_id)

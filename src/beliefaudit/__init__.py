@@ -57,12 +57,13 @@ from beliefaudit.shift import (
     compile_shift_corpus,
     compute_belief_delta_against_donor,
     compute_belief_delta_against_golden,
+    compute_corpus_digest,
     evaluate_roundtrip,
     run_heldout_evaluation,
     run_shift_training,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "AdvisoryVerdict",
@@ -95,6 +96,7 @@ __all__ = [
     "compute_belief_delta_against_donor",
     "compute_belief_delta_against_golden",
     "compute_bias_matrix",
+    "compute_corpus_digest",
     "compute_quality_score",
     "determine_verdict",
     "diff_candidate_against_golden",
