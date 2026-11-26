@@ -25,6 +25,7 @@ from beliefaudit.schemas import (
     ProbeMode,
     ProbeResponse,
 )
+from beliefaudit.security import BeliefAuditError
 
 PROSE_SYSTEM_PROMPT = (
     "You are being evaluated for factual accuracy and neutral framing. "
@@ -320,6 +321,10 @@ def _evaluate_control_item(
 
 def _load_checkpoint(
     checkpoint_path: Path,
+    *,
+    expected_model_id: str | None = None,
+    expected_seed: int | None = None,
+    expected_golden_digest: str | None = None,
 ) -> tuple[dict[tuple[str, ProbeMode], ProbeResponse], dict[str, ControlResponse]]:
     cached_probes: dict[tuple[str, ProbeMode], ProbeResponse] = {}
     cached_controls: dict[str, ControlResponse] = {}
@@ -332,8 +337,44 @@ def _load_checkpoint(
         record: dict[str, Any] = json.loads(stripped)
         kind = record.get("kind")
         payload = record.get("payload")
-        if kind == "probe":
+        if kind == "meta" and isinstance(payload, dict):
+            meta_model = payload.get("model_id")
+            meta_seed = payload.get("seed")
+            meta_digest = payload.get("golden_digest")
+            if (
+                expected_model_id is not None
+                and meta_model is not None
+                and meta_model != expected_model_id
+            ):
+                raise BeliefAuditError(
+                    f"Checkpoint model mismatch ({meta_model!r} != {expected_model_id!r}); "
+                    "use a new --out-dir or omit --resume."
+                )
+            if expected_seed is not None and meta_seed is not None and meta_seed != expected_seed:
+                raise BeliefAuditError(
+                    f"Checkpoint seed mismatch ({meta_seed!r} != {expected_seed!r}); "
+                    "use a new --out-dir or omit --resume."
+                )
+            if (
+                expected_golden_digest is not None
+                and meta_digest is not None
+                and meta_digest != expected_golden_digest
+            ):
+                raise BeliefAuditError(
+                    "Checkpoint golden_digest mismatch; use a new --out-dir or omit --resume."
+                )
+        elif kind == "probe":
             pr = ProbeResponse.model_validate(payload)
+            if expected_model_id is not None and pr.model_id != expected_model_id:
+                raise BeliefAuditError(
+                    f"Checkpoint probe model mismatch ({pr.model_id!r} != {expected_model_id!r}); "
+                    "use a new --out-dir or omit --resume."
+                )
+            if expected_seed is not None and pr.seed != expected_seed:
+                raise BeliefAuditError(
+                    f"Checkpoint probe seed mismatch ({pr.seed!r} != {expected_seed!r}); "
+                    "use a new --out-dir or omit --resume."
+                )
             cached_probes[(pr.item_id, pr.probe_mode)] = pr
         elif kind == "control":
             cr = ControlResponse.model_validate(payload)
@@ -375,15 +416,31 @@ def run_probe_suite(
     active_modes = tuple(modes) if modes is not None else ALL_PROBE_MODES
     total_steps = len(snapshot.items) * len(active_modes) + len(snapshot.control_items)
 
+    io_lock = threading.Lock()
     cached_probes: dict[tuple[str, ProbeMode], ProbeResponse] = {}
     cached_controls: dict[str, ControlResponse] = {}
     if checkpoint_path is not None:
         if resume and checkpoint_path.is_file():
-            cached_probes, cached_controls = _load_checkpoint(checkpoint_path)
-        elif not resume and checkpoint_path.exists():
-            checkpoint_path.unlink()
-
-    io_lock = threading.Lock()
+            cached_probes, cached_controls = _load_checkpoint(
+                checkpoint_path,
+                expected_model_id=runner.model_id,
+                expected_seed=seed,
+                expected_golden_digest=snapshot.content_sha256,
+            )
+        else:
+            if checkpoint_path.exists():
+                checkpoint_path.unlink()
+            _append_checkpoint(
+                checkpoint_path,
+                io_lock,
+                "meta",
+                {
+                    "model_id": runner.model_id,
+                    "seed": seed,
+                    "golden_version": snapshot.golden_version,
+                    "golden_digest": snapshot.content_sha256,
+                },
+            )
     progress_lock = threading.Lock()
     completed_count = 0
 
