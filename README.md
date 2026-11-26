@@ -76,6 +76,48 @@ uv run beliefaudit golden promote \
 
 ---
 
+## BeliefShift Closed-Loop Shifting (`v0.2.0`)
+
+`beliefaudit shift` extends auditing into a closed-loop **Model -> Knowledge Graph -> Modular LoRA -> Re-Audited Model** pipeline:
+
+```bash
+# 1. Compute Delta Graph (ΔG) against Golden Set or a clean Donor Model run
+uv run beliefaudit shift delta \
+  --base-run runs/qwen2.5-7b-quick/ \
+  --golden shards/golden_v0.1.0.json \
+  --out runs/qwen2.5-7b-quick/delta_graph.json
+
+# 2. Compile 6-view disjoint SFT + MLX + DPO corpus (adaptive 35–45% replay & anti-leakage gate)
+uv run beliefaudit shift compile \
+  --delta runs/qwen2.5-7b-quick/delta_graph.json \
+  --golden shards/golden_v0.1.0.json \
+  --out-dir runs/qwen2.5-7b-quick/compiled_corpus/
+
+# 3. Validate & generate/run modular LoRA adapter (dry-run | mlx for Apple Silicon | peft for CUDA)
+uv run beliefaudit shift train \
+  --corpus runs/qwen2.5-7b-quick/compiled_corpus/ \
+  --delta runs/qwen2.5-7b-quick/delta_graph.json \
+  --base-model "mlx-community/Qwen2.5-7B-Instruct-4bit" \
+  --backend dry-run \
+  --out-shard shards/qwen2.5-7b-lora/
+
+# 4. Run closed-loop verification (TSR, TSR_heldout, CDS, ΔQuality >= -3.0 gate)
+uv run beliefaudit shift verify \
+  --delta runs/qwen2.5-7b-quick/delta_graph.json \
+  --pre-run runs/qwen2.5-7b-quick/ \
+  --model "qwen2.5-7b-shifted" \
+  --endpoint "http://localhost:8080/v1" \
+  --golden shards/golden_v0.1.0.json \
+  --manifest shards/qwen2.5-7b-lora/lora_shard_manifest.json \
+  --out-dir runs/qwen2.5-7b-verified/
+```
+
+For decoupled GPU/Apple Silicon execution when optional `mlx-lm` or `torch`/`peft`/`trl` are installed:
+- Apple Silicon (`24 GB M3` defaults): `python scripts/train_mlx.py --data-dir runs/.../compiled_corpus/mlx_data --base-model mlx-community/Qwen2.5-7B-Instruct-4bit`
+- CUDA (`SFT + Stage 3B DPO`): `python scripts/train_peft.py --dataset runs/.../compiled_corpus/sft_train.jsonl --dpo-dataset runs/.../compiled_corpus/dpo_pairs.jsonl`
+
+---
+
 ## Development & Local CI
 
 ```bash
