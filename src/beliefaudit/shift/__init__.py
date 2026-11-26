@@ -17,6 +17,13 @@ from beliefaudit.shift.kg_compiler import (
     verify_no_eval_leakage,
 )
 from beliefaudit.shift.replay_bank import ReplayBankError, generate_replay_records
+from beliefaudit.shift.roundtrip_eval import (
+    RoundTripVerifyError,
+    evaluate_roundtrip,
+    render_roundtrip_markdown,
+    run_heldout_evaluation,
+    write_roundtrip_artifacts,
+)
 from beliefaudit.shift.schemas import (
     BeliefDeltaGraph,
     CategoryShiftDelta,
@@ -32,6 +39,14 @@ from beliefaudit.shift.schemas import (
     ShiftTargetKind,
     TrainingBackend,
 )
+from beliefaudit.shift.trainer import (
+    ShiftTrainerError,
+    build_training_command,
+    load_lora_manifest,
+    run_shift_training,
+    save_lora_manifest,
+    validate_corpus_for_training,
+)
 
 __all__ = [
     "BeliefDeltaGraph",
@@ -46,20 +61,31 @@ __all__ = [
     "LoRAShardManifest",
     "ReplayBankError",
     "RoundTripReport",
+    "RoundTripVerifyError",
     "SftTrainingRecord",
     "ShiftOperationType",
     "ShiftTargetKind",
+    "ShiftTrainerError",
     "TrainingBackend",
     "all_heldout_prompts",
     "build_heldout_pack",
+    "build_training_command",
     "compile_shift_corpus",
     "compute_belief_delta_against_donor",
     "compute_belief_delta_against_golden",
     "delta_graph_to_kr_layer",
+    "evaluate_roundtrip",
     "generate_replay_records",
     "load_corpus_manifest",
     "load_delta_graph",
+    "load_lora_manifest",
+    "render_roundtrip_markdown",
+    "run_heldout_evaluation",
+    "run_shift_training",
     "save_delta_graph",
+    "save_lora_manifest",
     "token_jaccard",
+    "validate_corpus_for_training",
     "verify_no_eval_leakage",
+    "write_roundtrip_artifacts",
 ]

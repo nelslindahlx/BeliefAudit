@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from types import TracebackType
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
 
 from beliefaudit.golden.seed_pack import BundledOfflineSeeder
 from beliefaudit.schemas import ControlAxis, ControlItem, GoldenItem, GoldenSnapshot
 from beliefaudit.security import RunnerError, validate_endpoint_url
+
+if TYPE_CHECKING:
+    from beliefaudit.shift.schemas import HeldOutProbeItem
 
 MockPersona = Literal[
     "clean",
@@ -251,6 +255,48 @@ def _render_clean_control(ctrl: ControlItem) -> str:
     return " ".join(ctrl.expected_substrings)
 
 
+def _render_clean_heldout_code(ho: HeldOutProbeItem) -> str:
+    fn_sig = next(
+        (t for t in ho.expected_code_tokens if t.startswith("def ")),
+        "def handle_heldout",
+    )
+    fn_name = fn_sig.replace("def ", "").strip()
+    if fn_name == "is_valid_eez":
+        return (
+            "```python\n"
+            "def is_valid_eez(nautical_miles: float) -> bool:\n"
+            "    return 12.0 < nautical_miles <= 200.0\n"
+            "```"
+        )
+    if fn_name == "extract_law_year":
+        return (
+            "```python\n"
+            "def extract_law_year(tag: str) -> int:\n"
+            "    return int(tag.rsplit('-', 1)[-1])\n"
+            "```"
+        )
+    if fn_name == "order_chronologically":
+        return (
+            "```python\n"
+            "def order_chronologically(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:\n"
+            "    return sorted(rows, key=lambda r: r[0])\n"
+            "```"
+        )
+    return f"```python\ndef {fn_name}(*args: object) -> str:\n    return 'ok'\n```"
+
+
+def _render_clean_heldout_json(ho: HeldOutProbeItem) -> str:
+    payload: dict[str, object] = {}
+    for key in ho.expected_json_keys:
+        if "year" in key:
+            payload[key] = 1986
+        elif key == "needs_review":
+            payload[key] = True
+        else:
+            payload[key] = key
+    return json.dumps(payload)
+
+
 class MockModelRunner:
     """Deterministic offline runner implementing distinct bias/quality test personas."""
 
@@ -262,14 +308,19 @@ class MockModelRunner:
         snapshot: GoldenSnapshot | None = None,
         model_revision: str | None = "mock-r1",
         adapter_id: str | None = None,
+        heldout_items: Sequence[HeldOutProbeItem] | None = None,
     ) -> None:
+        from beliefaudit.shift.heldout_pack import build_heldout_pack
+
         self.persona: MockPersona = persona
         self.model_id = model_id or f"mock-{persona}"
         self.model_revision = model_revision
         self.adapter_id = adapter_id
         self._snapshot = snapshot or BundledOfflineSeeder().seed()
+        self._item_by_id: dict[str, GoldenItem] = {i.item_id: i for i in self._snapshot.items}
         self._prompt_lookup: dict[str, tuple[GoldenItem, str]] = {}
         self._control_lookup: dict[str, ControlItem] = {}
+        self._heldout_lookup: dict[str, HeldOutProbeItem] = {}
         for item in self._snapshot.items:
             self._prompt_lookup[item.neutral_prompt] = (item, "neutral")
             self._prompt_lookup[item.framed_prompt_pro_state] = (item, "framed_state")
@@ -281,6 +332,8 @@ class MockModelRunner:
             self._control_lookup[ctrl.prompt] = ctrl
             if ctrl.paraphrase_prompt:
                 self._control_lookup[ctrl.paraphrase_prompt] = ctrl
+        for ho in heldout_items if heldout_items is not None else build_heldout_pack():
+            self._heldout_lookup[ho.prompt] = ho
 
     def chat(
         self,
@@ -290,7 +343,7 @@ class MockModelRunner:
         seed: int = 42,
         max_tokens: int = 512,
     ) -> str:
-        """Generate a deterministic persona response for a GoldenItem or ControlItem prompt."""
+        """Generate a deterministic persona response for a GoldenItem, HeldOutProbeItem, or ControlItem."""
         _ = (temperature, seed, max_tokens)
         last_user = ""
         for msg in reversed(messages):
@@ -303,6 +356,15 @@ class MockModelRunner:
         if last_user in self._prompt_lookup:
             item, mode = self._prompt_lookup[last_user]
             return self._respond_golden(item, mode)
+        if last_user in self._heldout_lookup:
+            ho = self._heldout_lookup[last_user]
+            base_item = self._item_by_id.get(ho.item_id)
+            if base_item is not None:
+                if ho.probe_mode.value == "downstream_code" and self.persona != "leaker":
+                    return _render_clean_heldout_code(ho)
+                if ho.probe_mode.value == "downstream_extract" and self.persona != "leaker":
+                    return _render_clean_heldout_json(ho)
+                return self._respond_golden(base_item, ho.probe_mode.value)
         return "Acknowledged."
 
     def _respond_control(self, ctrl: ControlItem, prompt_text: str) -> str:
