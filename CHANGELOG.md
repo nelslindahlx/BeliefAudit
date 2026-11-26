@@ -2,6 +2,14 @@
 
 All notable changes to **BeliefAudit** are documented in this file.
 
+## [0.2.0] - 2026-11-26
+
+### Added
+- **BeliefShift Closed-Loop Shifting Pipeline** (`Issue #5`, `PR #6`–`#9`):
+  - `src/beliefaudit/shift/schemas.py` & `src/beliefaudit/shift/delta_engine.py`: Golden Set (`compute_belief_delta_against_golden`) & Donor Shard (`compute_belief_delta_against_donor`) delta graphs with `INJECT`/`CORRECT`/`REFRAME`/`DE_LEAK` classification, `checkpoint.jsonl` raw-excerpt harvesting, Donor Poisoning Guard, `AuditProfile.QUICK` awareness, and KnowledgeReduce `DIFFERENCE` shard export (`beliefaudit shift delta`).
+  - `src/beliefaudit/shift/kg_compiler.py`, `replay_bank.py`, & `heldout_pack.py`: 6-view disjoint SFT + `mlx_data/` + contrastive DPO compiler, 40-item general capability replay bank with adaptive 35–45% floor, optional fail-closed `--expander-model`, 18 unseen held-out generalization probes, and mechanical `verify_no_eval_leakage` gate (`beliefaudit shift compile`).
+  - `src/beliefaudit/shift/trainer.py`, `roundtrip_eval.py`, `scripts/train_mlx.py`, & `scripts/train_peft.py`: Zero-ML-core LoRA orchestrator (`dry-run` | `mlx` | `peft`), closed-loop `TSR`/`TSR_heldout`/`CDS`/`ΔQuality`/`ΔBiasRisk` gates, parrot-alignment warning (`beliefaudit shift train|verify`), and `examples/offline_shift_demo.py`.
+
 ## [0.1.3] - 2026-11-26
 
 ### Fixed
