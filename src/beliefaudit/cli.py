@@ -41,8 +41,10 @@ from beliefaudit.shift.delta_engine import (
     compute_belief_delta_against_donor,
     compute_belief_delta_against_golden,
     delta_graph_to_kr_layer,
+    load_delta_graph,
     save_delta_graph,
 )
+from beliefaudit.shift.kg_compiler import compile_shift_corpus
 
 app = typer.Typer(
     name="beliefaudit",
@@ -408,6 +410,71 @@ def shift_delta_cmd(
         if kr_shard is not None:
             kr_path = export_kr_json(delta_graph_to_kr_layer(delta), kr_shard)
             typer.echo(f"Exported KnowledgeReduce Delta shard -> {kr_path}")
+    except (BeliefAuditError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@shift_app.command("compile")
+def shift_compile_cmd(
+    delta: Annotated[Path, typer.Option("--delta", help="BeliefDeltaGraph JSON path.")],
+    golden: Annotated[Path, typer.Option("--golden", help="GoldenSnapshot JSON path.")],
+    out_dir: Annotated[
+        Path, typer.Option("--out-dir", help="Output directory for compiled SFT + DPO corpus.")
+    ],
+    replay_dataset: Annotated[
+        Path | None,
+        typer.Option("--replay-dataset", help="Optional custom chat-JSONL replay dataset."),
+    ] = None,
+    min_replay_ratio: Annotated[
+        float | None,
+        typer.Option("--min-replay-ratio", help="Override adaptive replay ratio floor (0..0.99)."),
+    ] = None,
+    expander_model: Annotated[
+        str | None,
+        typer.Option(
+            "--expander-model", help="Optional separate local model for extra paraphrases."
+        ),
+    ] = None,
+    expander_endpoint: Annotated[
+        str,
+        typer.Option("--expander-endpoint", help="Local OpenAI-compatible endpoint for expander."),
+    ] = "http://localhost:11434/v1",
+    allow_remote: Annotated[
+        bool, typer.Option("--allow-remote", help="Opt in to non-loopback endpoint URLs.")
+    ] = False,
+    seed: Annotated[int, typer.Option("--seed", help="Deterministic shuffle/split seed.")] = 42,
+) -> None:
+    """Compile ΔG into a disjoint 6-view SFT + MLX + DPO corpus with anti-leakage verification."""
+    try:
+        delta_graph = load_delta_graph(delta)
+        snapshot = load_golden_snapshot(golden)
+        expander_runner: LocalOpenAICompatRunner | None = None
+        if expander_model is not None:
+            expander_runner = LocalOpenAICompatRunner(
+                model_id=expander_model,
+                base_url=expander_endpoint,
+                allow_remote=allow_remote,
+            )
+        try:
+            manifest = compile_shift_corpus(
+                delta_graph,
+                snapshot,
+                out_dir,
+                custom_replay_path=replay_dataset,
+                min_replay_ratio=min_replay_ratio,
+                seed=seed,
+                expander_runner=expander_runner,
+            )
+        finally:
+            if expander_runner is not None:
+                expander_runner.close()
+
+        typer.echo(
+            f"Compiled {manifest.corpus_id} | sft_train={manifest.sft_train_count} "
+            f"sft_valid={manifest.sft_valid_count} dpo={manifest.dpo_pair_count} "
+            f"replay_ratio={manifest.replay_ratio:.2f} leakage_ok={manifest.leakage_check_passed}"
+        )
     except (BeliefAuditError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
