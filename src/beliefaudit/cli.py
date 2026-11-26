@@ -37,6 +37,12 @@ from beliefaudit.shards.mapper import (
     golden_snapshot_to_kr_layer,
     import_kr_json,
 )
+from beliefaudit.shift.delta_engine import (
+    compute_belief_delta_against_donor,
+    compute_belief_delta_against_golden,
+    delta_graph_to_kr_layer,
+    save_delta_graph,
+)
 
 app = typer.Typer(
     name="beliefaudit",
@@ -44,7 +50,9 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 golden_app = typer.Typer(help="Manage immutable versioned Golden Set snapshots.")
+shift_app = typer.Typer(help="Closed-loop BeliefShift (delta -> compile -> train -> verify).")
 app.add_typer(golden_app, name="golden")
+app.add_typer(shift_app, name="shift")
 
 VALID_MOCK_PERSONAS = ("clean", "skewed", "sycophant", "refuser", "leaker", "low_quality")
 
@@ -364,6 +372,42 @@ def inspect_cmd(
         )
         for conf in conflicts:
             typer.echo(f"  - {conf.target_key}: {conf.resolution_notes}")
+    except (BeliefAuditError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@shift_app.command("delta")
+def shift_delta_cmd(
+    base_run: Annotated[
+        Path, typer.Option("--base-run", help="Completed base model audit run directory.")
+    ],
+    golden: Annotated[Path, typer.Option("--golden", help="GoldenSnapshot JSON path.")],
+    out: Annotated[Path, typer.Option("--out", "-o", help="Output BeliefDeltaGraph JSON path.")],
+    donor_run: Annotated[
+        Path | None,
+        typer.Option("--donor-run", help="Optional clean donor model run directory."),
+    ] = None,
+    kr_shard: Annotated[
+        Path | None,
+        typer.Option("--kr-shard", help="Optional KnowledgeReduce DIFFERENCE shard JSON path."),
+    ] = None,
+) -> None:
+    """Compute a BeliefDeltaGraph (ΔG) against a Golden Set or Donor Model run."""
+    try:
+        snapshot = load_golden_snapshot(golden)
+        if donor_run is not None:
+            delta = compute_belief_delta_against_donor(base_run, donor_run, snapshot)
+        else:
+            delta = compute_belief_delta_against_golden(base_run, snapshot)
+        written = save_delta_graph(delta, out)
+        typer.echo(
+            f"Delta {delta.delta_id} ({delta.target_kind.value} -> {delta.target_id}) | "
+            f"ops={len(delta.operations)} unchanged_items={len(delta.unchanged_item_ids)} -> {written}"
+        )
+        if kr_shard is not None:
+            kr_path = export_kr_json(delta_graph_to_kr_layer(delta), kr_shard)
+            typer.echo(f"Exported KnowledgeReduce Delta shard -> {kr_path}")
     except (BeliefAuditError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
